@@ -38,7 +38,7 @@ from qiskit_aer.noise import NoiseModel
 # The config file describes everything about the model structure.
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--config", default="default_mnist.yaml")
+parser.add_argument("--config", default="configs_mnist.yaml")
 args = parser.parse_args()
 
 configs.load(args.config)
