@@ -1,0 +1,36 @@
+# ===== remove original project stuff =====
+examples/
+docs/
+.github/
+*.ipynb
+LICENSE
+logo*
+figs/
+
+# ===== datasets =====
+fashion_mnist_data/
+mnist_data/
+runs/
+
+# ===== environments =====
+new_venv/
+venv/
+__pycache__/
+*.pyc
+
+# ===== checkpoints / outputs =====
+*.pt
+*.pth
+*.ckpt
+logs/
+outputs/
+
+# ===== readthedocs / packaging leftovers =====
+readthedocs.yaml
+setup.py
+requirement_update.txt
+
+# ===== misc =====
+.DS_Store
+.idea/
+.vscode/
