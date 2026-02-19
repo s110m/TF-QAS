@@ -152,8 +152,6 @@ class SuperQFCModel0(tq.QuantumModule):
         return space
 
 
-# Load the model.
-
 print(f"Using torchquantum from: {os.path.dirname(tq.__file__)}")
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 if isinstance(configs.optimizer.lr, str):
