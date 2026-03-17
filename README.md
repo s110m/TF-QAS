@@ -7,7 +7,7 @@ Published in *Entropy (MDPI), 2026* https://www.mdpi.com/1099-4300/28/3/330
 
 ---
 
-## 📖 Overview
+## Overview
 
 Designing robust parameterized quantum circuits (PQCs) in the NISQ era is challenging due to:
 
