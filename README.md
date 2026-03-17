@@ -3,7 +3,7 @@
 🚀 Official implementation of the paper:
 
 **"Training-Free Quantum Architecture Search Under Realistic Noise via Expressibility-Guided Evolution"**
-Published in *Entropy (MDPI), 2026*
+Published in *Entropy (MDPI), 2026* https://www.mdpi.com/1099-4300/28/3/330
 
 ---
 
