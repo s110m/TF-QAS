@@ -39,7 +39,7 @@ This enables:
 
 ## 🖼️ Framework Comparison
 
-![QAS Comparison](images/fig_qas_comparison.pdf)
+![QAS Comparison](images/fig_qas_comparison.png)
 
 **Figure:** Comparison between:
 
