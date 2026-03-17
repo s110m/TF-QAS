@@ -68,7 +68,7 @@ pip install -r requirements.txt
 
 ```bash
 python train_supercircuit.py
-
+```
 ---
 
 ### 2️⃣ Expressibility-Guided Search (Ours)
