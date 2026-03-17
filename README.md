@@ -1,6 +1,6 @@
 # Training-Free Quantum Architecture Search via Expressibility
 
-🚀 Official implementation of the paper:
+Official implementation of the paper:
 
 **"Training-Free Quantum Architecture Search Under Realistic Noise via Expressibility-Guided Evolution"**
 Published in *Entropy (MDPI), 2026* https://www.mdpi.com/1099-4300/28/3/330
@@ -19,7 +19,7 @@ This work proposes a **training-free and device-agnostic quantum architecture se
 
 ---
 
-## 🧠 Key Idea
+## Key Idea
 
 Instead of:
 
@@ -37,7 +37,7 @@ This enables:
 
 ---
 
-## 🖼️ Framework Comparison
+##  Framework Comparison
 
 ![QAS Comparison](images/fig_qas_comparison.png)
 
@@ -46,14 +46,14 @@ This enables:
 * (a) SuperCircuit-based QAS (e.g., QuantumNAS)
 * (b) Proposed expressibility-guided training-free QAS
 
-👉 Our method removes:
+ Our method removes:
 
 * SuperCircuit training
 * repeated noisy evaluation during search
 
 ---
 
-## ⚙️ Installation
+##  Installation
 
 Create environment and install dependencies:
 
@@ -61,7 +61,7 @@ pip install -r requirements.txt
 
 ---
 
-## 🚀 Usage
+##  Usage
 
 ### 1️⃣ Train SuperCircuit (Baseline)
 
@@ -105,7 +105,7 @@ We thank the authors for providing an open-source quantum machine learning frame
 
 ---
 
-## ⚡ Key Result: Search Efficiency
+##  Key Result: Search Efficiency
 
 The main contribution of this work is **drastically reducing the computational cost of quantum architecture search**.
 
@@ -122,7 +122,7 @@ The main contribution of this work is **drastically reducing the computational c
 
 ---
 
-## 📊 Performance (for completeness)
+##  Performance
 
 | Method                      | Accuracy |
 |---------------------------|----------|
@@ -132,7 +132,7 @@ The main contribution of this work is **drastically reducing the computational c
 
 👉 We achieve **competitive performance** while being **orders of magnitude more efficient**.
 
-## ⚡ Advantages
+##  Advantages
 
 * No SuperCircuit training
 * No noisy evaluation during search
@@ -142,7 +142,7 @@ The main contribution of this work is **drastically reducing the computational c
 
 ---
 
-## 📌 Citation
+##  Citation
 
 If you use this code, please cite:
 
@@ -160,37 +160,3 @@ ISSN = {1099-4300},
 DOI = {10.3390/e28030330}
 }
 
-
----
-
-## 📬 Contact
-
-Seyed Ali Mousavi
-[seyedali.mousavi@mdu.se](mailto:seyedali.mousavi@mdu.se)
-Mälardalen University, Sweden
-
----
-
-## ⭐ Acknowledgment
-
-This work was supported by:
-
-* Swedish Research Council (GreenDL)
-* NAISS supercomputing infrastructure
-* European Union & Estonian Research Council
-
----
-
-## ⚠️ Notes
-
-* The search phase is **fully training-free**
-* Final performance requires training selected architectures
-* Experiments use IBM Qiskit fake backends for realistic noise simulation
-
----
-
-## 🔮 Future Work
-
-* Larger qubit systems
-* Joint architecture–mapping optimization
-* Deployment on real quantum hardware
