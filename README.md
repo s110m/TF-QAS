@@ -65,17 +65,17 @@ pip install -r requirements.txt
 
 ### 1️⃣ Train SuperCircuit (Baseline)
 
-python train_supercircuit.py --config configs_train_supercircuit_mnist.yml
+python train_supercircuit.py
 
 ---
 
 ### 2️⃣ Expressibility-Guided Search (Ours)
 
-python expr_search_mnist.py --config configs_mnist.yaml
+python expr_search_mnist.py 
 
 Fashion-MNIST:
 
-python expr_search_fashion_mnist.py --config configs_fashion_mnist.yaml
+python expr_search_fashion_mnist.py
 
 👉 This implements:
 
@@ -86,29 +86,13 @@ python expr_search_fashion_mnist.py --config configs_fashion_mnist.yaml
 
 ### 3️⃣ QuantumNAS-style Baseline
 
-python quantumnas_style_search.py --config configs_mnist.yaml
+python quantumnas_style_search.py 
 
 👉 Includes:
 
 * SuperCircuit-based evaluation
 * noisy performance estimation
-
----
-
-## 📁 Repository Structure
-
-.
-├── torchquantum/                  # Quantum simulation backend (adapted from TorchQuantum)
-├── configs_*.yaml                # Experiment configurations
-├── train_supercircuit.py         # SuperCircuit training
-├── expr_search_mnist.py          # Expressibility-guided search (MNIST)
-├── expr_search_fashion_mnist.py  # Expressibility search (Fashion-MNIST)
-├── quantumnas_style_search.py    # QuantumNAS-style baseline
-├── expressibility_both_case.py   # Expressibility computation
-├── loss_expr_relation.py         # Correlation analysis
-├── spearman_utils.py             # Ranking metrics
-├── requirements.txt              # Dependencies
-
+ 
 ---
 
 ## 🔧 Implementation Details
@@ -121,21 +105,32 @@ We thank the authors for providing an open-source quantum machine learning frame
 
 ---
 
-## 📊 Key Results
+## ⚡ Key Result: Search Efficiency
 
-| Method                    | Accuracy |
-| ------------------------- | -------- |
+The main contribution of this work is **drastically reducing the computational cost of quantum architecture search**.
+
+| Method                      | SuperCircuit Training | Search / Ranking        | Final Training |
+|---------------------------|----------------------|-------------------------|----------------|
+| Random Search             | —                    | —                       | ~5 h           |
+| QuantumNAS-style          | ~3 h                 | ~4 days 18 h            | ~5 h           |
+| **Ours (Expressibility)** | —                    | **~2 h**                | ~5 h           |
+
+👉 **Key insight:**
+- Our method eliminates **SuperCircuit training**
+- Avoids **expensive noisy evaluations during search**
+- Reduces search time from **~5 days → ~2 hours**
+
+---
+
+## 📊 Performance (for completeness)
+
+| Method                      | Accuracy |
+|---------------------------|----------|
 | Random Search             | 0.62     |
 | QuantumNAS-style          | **0.75** |
 | **Ours (Expressibility)** | 0.71     |
 
-👉 Our method achieves:
-
-* competitive performance
-* significantly lower computational cost
-* fully training-free search phase
-
----
+👉 We achieve **competitive performance** while being **orders of magnitude more efficient**.
 
 ## ⚡ Advantages
 
