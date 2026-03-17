@@ -239,7 +239,7 @@ callbacks:
 
 dataset:
   name: mnist
-  root: 'examples/data'
+  root: 'examples/data/fashion_mnist'
   train_valid_split_ratio: [0.95, 0.05]
   center_crop: 24
   resize: 28
@@ -251,7 +251,7 @@ dataset:
   n_valid_samples: null
   input_name: image
   target_name: digit
-  fashion: False
+  fashion: True
 
 criterion:
   name: nll
