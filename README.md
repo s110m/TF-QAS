@@ -72,13 +72,13 @@ python train_supercircuit.py
 ---
 
 ### 2️⃣ Expressibility-Guided Search (Ours)
-
+```bash
 python expr_search_mnist.py 
-
+```
 Fashion-MNIST:
-
+```bash
 python expr_search_fashion_mnist.py
-
+```
 👉 This implements:
 
 * random search
@@ -87,9 +87,9 @@ python expr_search_fashion_mnist.py
 ---
 
 ### 3️⃣ QuantumNAS-style Baseline
-
+```bash
 python quantumnas_style_search.py 
-
+```
 👉 Includes:
 
 * SuperCircuit-based evaluation
