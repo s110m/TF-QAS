@@ -151,12 +151,21 @@ We thank the authors for providing an open-source quantum machine learning frame
 
 If you use this code, please cite:
 
-@article{mousavi2026expressibility,
-title={Training-Free Quantum Architecture Search Under Realistic Noise via Expressibility-Guided Evolution},
-author={Mousavi, Seyedali and Mousavi, Seyedhamidreza and Pettersson, Paul and Daneshtalab, Masoud},
-journal={Entropy},
-year={2026}
+
+@Article{e28030330,
+AUTHOR = {Mousavi, Seyedali and Mousavi, Seyedhamidreza and Pettersson, Paul and Daneshtalab, Masoud},
+TITLE = {Training-Free Quantum Architecture Search Under Realistic Noise via Expressibility-Guided Evolution},
+JOURNAL = {Entropy},
+VOLUME = {28},
+YEAR = {2026},
+NUMBER = {3},
+ARTICLE-NUMBER = {330},
+URL = {https://www.mdpi.com/1099-4300/28/3/330},
+ISSN = {1099-4300},
+ABSTRACT = {Designing noise-robust parameterized quantum circuits (PQCs) is a central challenge in the noisy intermediate-scale quantum (NISQ) regime. Existing quantum architecture search methods rely on training large SuperCircuits and evaluating SubCircuits under noisy execution, resulting in high computational cost and architecture assessments that depend on task-specific optimization and device noise. In this work, we propose a training-free quantum architecture search framework based on information-theoretic expressibility measures rather than performance-based estimators. We empirically show that noise-free KL-divergence-based expressibility exhibits a consistent monotonic association with noisy task loss across diverse circuit architectures and realistic hardware noise models. Leveraging this relationship, we introduce an expressibility-guided evolutionary search that requires neither SuperCircuit training nor noisy execution during the search phase. Since expressibility is evaluated independently of hardware noise, the method is inherently device-agnostic, enabling architectures to be reused across multiple quantum devices without re-running the search. Experiments using IBM-derived Qiskit noise models demonstrate that the proposed approach achieves competitive performance compared to SuperCircuit-based baselines, while substantially reducing computational cost. These results establish expressibility as an effective information-theoretic surrogate for ranking PQC architectures under realistic noise.},
+DOI = {10.3390/e28030330}
 }
+
 
 ---
 
