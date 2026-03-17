@@ -57,14 +57,16 @@ This enables:
 
 Create environment and install dependencies:
 
+```bash
 pip install -r requirements.txt
-
+```
 ---
 
 ##  Usage
 
 ### 1️⃣ Train SuperCircuit (Baseline)
 
+```bash
 python train_supercircuit.py
 
 ---
