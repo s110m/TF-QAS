@@ -29,6 +29,7 @@ outputs/
 readthedocs.yaml
 setup.py
 requirement_update.txt
+h2_new.txt
 
 # ===== misc =====
 .DS_Store
