@@ -72,6 +72,7 @@ python train_supercircuit.py
 ---
 
 ### 2️⃣ Expressibility-Guided Search (Ours)
+MNIST
 ```bash
 python expr_search_mnist.py 
 ```
