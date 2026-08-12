@@ -468,7 +468,7 @@ class MeasureMultiQubitPauliSum(tq.QuantumModule):
     def forward(self, qdev: tq.QuantumDevice):
         res_all = self.measure_multiple_times(qdev)
         return (res_all * self.obs_list[0]["coefficient"]).sum(-1)
-
+    
 
 if __name__ == '__main__':
     import pdb

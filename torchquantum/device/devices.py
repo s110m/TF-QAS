@@ -129,6 +129,9 @@ class QuantumDevice(nn.Module):
         return f" class: {self.name} \n device name: {self.device_name} \n number of qubits: {self.n_wires} \n batch size: {self.bsz} \n current computing device: {self.state.device} \n recording op history: {self.record_op} \n current states: {repr(self.get_states_1d().cpu().detach().numpy())}"
 
 
+# The following two for loops, add attributes to the QuantumDevice objects. After this, you can use for example q_dev.h and it works. 
+
+
 for func_name, func in func_name_dict.items():
     setattr(QuantumDevice, func_name, func)
 
