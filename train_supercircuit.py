@@ -1,276 +1,302 @@
+"""Train a weight-sharing quantum supercircuit.
+
+The resulting validation-selected checkpoint is consumed by
+``quantumnas_style_search.py`` and ``loss_expr_relation.py``. The default
+configuration trains a four-class MNIST supercircuit.
+
+Run the lightweight compatibility check before full training::
+
+    python train_supercircuit.py --smoke-test
+"""
+
+from __future__ import annotations
+
 import argparse
-import os
+import copy
+import random
 import sys
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-import pdb
+from collections.abc import Mapping
+from pathlib import Path
+from typing import Any
+
 import numpy as np
 import torch
-import torch.backends.cudnn
-import torch.cuda
-import torch.nn
-import torch.utils.data
+import torch.nn.functional as F
 import torchquantum as tq
-
-from torchpack.utils import io
-# from torchpack import distributed as dist
+import torchquantum.algorithm.quantumnas.super_layers
+import torchquantum.device
+import torchquantum.measurement
+import torchquantum.operator
 from torchpack.environ import set_run_dir
+from torchpack.utils import io
 from torchpack.utils.config import configs
 from torchpack.utils.logging import logger
+
 from core import builder
-from torchquantum.plugin import tq2qiskit, qiskit2tq
-from torchquantum.util import (build_module_from_op_list,
-                                build_module_op_list,
-                                get_v_c_reg_mapping,
-                                get_p_c_reg_mapping,
-                                get_p_v_reg_mapping,
-                                get_cared_configs)
+from expr_search_mnist import SuperQFCModel, portable_state_dict
 from torchquantum.algorithm.quantumnas.super_utils import get_named_sample_arch
+from torchquantum.plugin import qiskit2tq, tq2qiskit
+from torchquantum.plugin.qiskit.qiskit_processor import QiskitProcessor
+from torchquantum.util import (
+    build_module_from_op_list,
+    build_module_op_list,
+    get_cared_configs,
+    get_p_c_reg_mapping,
+    get_p_v_reg_mapping,
+    get_v_c_reg_mapping,
+)
 
 
-def main() -> None:
-    # dist.init()
-    torch.backends.cudnn.benchmark = True
-    # torch.cuda.set_device(dist.local_rank())
+DEFAULT_CONFIG = "configs_train_supercircuit_mnist.yml"
+DEFAULT_RUNS_DIR = Path("runs")
 
-    parser = argparse.ArgumentParser()
-    # parser.add_argument('config', metavar='FILE', help='config file')
+
+def parse_args() -> tuple[argparse.Namespace, list[str]]:
+    """Parse script arguments and preserve TorchPack configuration overrides."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("config", nargs="?", default=DEFAULT_CONFIG)
     parser.add_argument(
-        'config',
-        metavar='FILE',
-        nargs='?',   # makes it optional if default is given
-        default="configs_train_supercircuit_mnist.yml",
-        help='config file'
+        "--checkpoint-dir",
+        "--ckpt-dir",
+        type=Path,
+        default=None,
+        help="Base directory for the configured resume checkpoint.",
     )
-    parser.add_argument('--ckpt-dir', metavar='DIR', help='run directory')
-    parser.add_argument('--pdb', action='store_true', help='pdb')
-    parser.add_argument('--gpu', type=str, help='gpu ids', default=None)
-    parser.add_argument('--print-configs', action='store_true',
-                        help='print ALL configs')
-    args, opts = parser.parse_known_args()
+    parser.add_argument(
+        "--run-dir",
+        type=Path,
+        default=None,
+        help="Output directory; defaults to runs/<configuration-name>.",
+    )
+    parser.add_argument("--gpu", help="CUDA device IDs, for example '0' or '0,1'.")
+    parser.add_argument("--pdb", action="store_true")
+    parser.add_argument("--print-configs", action="store_true")
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=None,
+        help="Override DataLoader workers (use 0 in restricted Windows shells).",
+    )
+    parser.add_argument(
+        "--smoke-test",
+        action="store_true",
+        help="Run one synthetic optimization step and checkpoint check.",
+    )
+    return parser.parse_known_args()
 
-    configs.load(args.config, recursive=True) # Note: recursive here means that it loads all configs in default.yml files in recursive way.  
-    configs.update(opts)
 
-    if configs.debug.pdb or args.pdb:
-        pdb.set_trace()
+def configure_runtime(cfg: Any, gpu_ids: str | None) -> torch.device:
+    """Seed random generators and select the configured device."""
+    if gpu_ids is not None:
+        # CUDA reads this value lazily when its runtime is initialized.
+        import os
 
-    if args.gpu is not None:
-        os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
+        os.environ["CUDA_VISIBLE_DEVICES"] = gpu_ids
 
-    if configs.debug.set_seed:
-        torch.manual_seed(configs.debug.seed)
-        np.random.seed(configs.debug.seed)
+    if cfg.debug.set_seed:
+        seed = int(cfg.debug.seed)
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.benchmark = False
 
-    if configs.run.device == 'gpu':
-        if torch.cuda.is_available():
-            device = torch.device('cuda')
-        else:
-            configs.run.device = 'cpu'
-            device = torch.device('cpu')
-    elif configs.run.device == 'cpu':
-        device = torch.device('cpu')
-    else:
-        raise ValueError(configs.run.device)
+    if cfg.run.device == "gpu" and torch.cuda.is_available():
+        return torch.device("cuda")
+    if cfg.run.device == "gpu":
+        logger.warning("GPU was requested but CUDA is unavailable; using CPU.")
+        cfg.run.device = "cpu"
+        return torch.device("cpu")
+    if cfg.run.device == "cpu":
+        return torch.device("cpu")
+    raise ValueError(f"Unsupported run device: {cfg.run.device!r}")
 
-    if isinstance(configs.optimizer.lr, str):
-        configs.optimizer.lr = eval(configs.optimizer.lr)
 
-    # set the run dir according to config file's name
-    args.run_dir = 'runs/' + args.config.replace('/', '.').replace(
-        'examples.', '').replace('.yml', '').replace('configs.', '')
-    set_run_dir(args.run_dir)
+def default_run_dir(config_path: str) -> Path:
+    """Derive a stable run directory from a configuration filename."""
+    config_name = Path(config_path).stem
+    if config_name.startswith("configs_"):
+        config_name = config_name.removeprefix("configs_")
+    return DEFAULT_RUNS_DIR / config_name
 
-    logger.info(' '.join([sys.executable] + sys.argv))
 
-    if args.print_configs:
-        print_conf = configs
-    else:
-        print_conf = get_cared_configs(configs, 'train')
-
-    logger.info(f'Training started: "{args.run_dir}".' + '\n' +
-                f'{print_conf}')
+def build_dataflow(
+    cfg: Any,
+    num_workers: int | None = None,
+) -> dict[str, torch.utils.data.DataLoader]:
+    """Build reproducible train, validation, and test loaders."""
+    workers = (
+        int(cfg.run.workers_per_gpu)
+        if num_workers is None
+        else int(num_workers)
+    )
+    if workers < 0:
+        raise ValueError("num_workers cannot be negative")
 
     dataset = builder.make_dataset()
-    dataflow = dict()
-
-    # for split in dataset:
-    #     sampler = torch.utils.data.distributed.DistributedSampler(
-    #         dataset[split],
-    #         num_replicas=dist.size(),
-    #         rank=dist.rank(),
-    #         shuffle=(split == 'train'))
-    #     dataflow[split] = torch.utils.data.DataLoader(
-    #         dataset[split],
-    #         batch_size=configs.run.bsz // dist.size(),
-    #         sampler=sampler,
-    #         num_workers=configs.run.workers_per_gpu,
-    #         pin_memory=True)
-
+    train_generator = torch.Generator().manual_seed(int(cfg.debug.seed))
+    dataflow = {}
     for split in dataset:
-        if split == 'train':
-            sampler = torch.utils.data.RandomSampler(dataset[split])
-            batch_size = configs.run.bsz
-        else:
-            # for valid and test, use SequentialSampler to make the train.py
-            # and eval.py results consistent
-            sampler = torch.utils.data.SequentialSampler(dataset[split])
-            batch_size = getattr(configs.run, 'eval_bsz', configs.run.bsz)
-
+        is_training = split == "train"
+        batch_size = (
+            int(cfg.run.bsz)
+            if is_training
+            else int(getattr(cfg.run, "eval_bsz", cfg.run.bsz))
+        )
         dataflow[split] = torch.utils.data.DataLoader(
             dataset[split],
-            batch_size=configs.run.bsz, # 5 I changed this. Revert it later. 
-            sampler=sampler,
-            num_workers=0, #configs.run.workers_per_gpu, # 0
-            pin_memory=True)
+            batch_size=batch_size,
+            shuffle=is_training,
+            generator=train_generator if is_training else None,
+            num_workers=workers,
+            pin_memory=cfg.run.device == "gpu",
+        )
+    return dataflow
 
-    model = builder.make_model()
 
-    state_dict = {}
-    solution = None
-    score = None
-    if configs.ckpt.load_ckpt:
-        logger.warning('Loading checkpoint!')
-        state_dict = io.load(
-            os.path.join(args.ckpt_dir, configs.ckpt.name),
-            map_location='cpu')
-        if getattr(state_dict, 'model_arch', None) is not None:
-            model_load = state_dict['model_arch']
-            for module_load, module in zip(model_load.modules(), model.modules()):
-                if isinstance(module, tq.RandomLayer):
-                    # random layer, need to restore the architecture
-                    module.rebuild_random_layer_from_op_list(
-                        n_ops_in=module_load.n_ops,
-                        wires_in=module_load.wires,
-                        op_list_in=module_load.op_list,
-                    )
+def _register_legacy_checkpoint_aliases(model: torch.nn.Module) -> None:
+    """Register module aliases needed by checkpoints from older scripts."""
+    sys.modules["__main__"].SuperQFCModel0 = model.__class__
+    aliases = {
+        "torchquantum.devices": torchquantum.device,
+        "torchquantum.super_layers": (
+            torchquantum.algorithm.quantumnas.super_layers
+        ),
+        "torchquantum.operators": torchquantum.operator,
+        "torchquantum.measure": torchquantum.measurement,
+    }
+    for legacy_name, current_module in aliases.items():
+        sys.modules.setdefault(legacy_name, current_module)
 
-        if not configs.ckpt.weight_from_scratch:
-            model.load_state_dict(state_dict['model'], strict=False)
-        else:
-            logger.warning(f"DO NOT load weight, train weights from scratch!")
 
-        if 'solution' in state_dict.keys():
-            solution = state_dict['solution']
-            logger.info(f"Loading the solution {solution}")
-            logger.info(f"Original score: {state_dict['score']}")
-            model.set_sample_arch(solution['arch'])
-            score = state_dict['score']
+def resolve_checkpoint_path(
+    checkpoint_dir: Path | None,
+    configured_name: str,
+) -> Path:
+    """Resolve a configured checkpoint name against an optional base directory."""
+    checkpoint_path = Path(configured_name)
+    if checkpoint_dir is not None and not checkpoint_path.is_absolute():
+        checkpoint_path = checkpoint_dir / checkpoint_path
+    return checkpoint_path.resolve()
 
-        if 'v_c_reg_mapping' in state_dict.keys():
-            try:
-                model.measure.set_v_c_reg_mapping(
-                    state_dict['v_c_reg_mapping'])
-            except AttributeError:
-                logger.warning(f"Cannot set v_c_reg_mapping.")
 
-        if configs.model.load_op_list:
-            assert state_dict['q_layer_op_list'] is not None
-            logger.warning(f"Loading the op_list, will replace the q_layer in "
-                           f"the original model!")
-            q_layer = build_module_from_op_list(state_dict['q_layer_op_list'])
-            model.q_layer = q_layer
+def load_training_checkpoint(
+    model: torch.nn.Module,
+    checkpoint_path: Path,
+    cfg: Any,
+) -> tuple[dict[str, Any], Any, Any]:
+    """Load model state and optional architecture-search metadata."""
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
 
-    if configs.model.transpile_before_run:
-        # transpile the q_layer
-        logger.warning(f"Transpile the q_layer to basis gate set before "
-                       f"training, will replace the q_layer!")
-        processor = builder.make_qiskit_processor()
+    _register_legacy_checkpoint_aliases(model)
+    checkpoint = io.load(
+        str(checkpoint_path),
+        map_location="cpu",
+        weights_only=False,
+    )
+    if not isinstance(checkpoint, Mapping) or "model" not in checkpoint:
+        raise ValueError("Checkpoint must contain a 'model' state dictionary")
 
-        if getattr(model, 'q_layer', None) is not None:
-            circ = tq2qiskit(model.q_device, model.q_layer)
-            """
-            add measure because the transpile process may permute the wires, 
-            so we need to get the final q reg to c reg mapping 
-            """
-            circ.measure(list(range(model.q_device.n_wires)),
-                         list(range(model.q_device.n_wires)))
-            logger.info("Transpiling circuit...")
+    if not bool(getattr(cfg.ckpt, "weight_from_scratch", False)):
+        model.load_state_dict(checkpoint["model"], strict=False)
+    else:
+        logger.warning("Checkpoint weights ignored; training from scratch.")
 
-            if solution is not None:
-                processor.set_layout(solution['layout'])
-                logger.warning(f"Set layout {solution['layout']} for transpile!")
+    solution = checkpoint.get("solution")
+    score = checkpoint.get("score")
+    if solution is not None:
+        model.set_sample_arch(solution["arch"])
+        logger.info(f"Loaded architecture solution: {solution}")
 
-            circ_transpiled = processor.transpile(circs=circ)
-            q_layer = qiskit2tq(circ=circ_transpiled)
+    register_mapping = checkpoint.get("v_c_reg_mapping")
+    if register_mapping is not None and hasattr(model, "measure"):
+        model.measure.set_v_c_reg_mapping(register_mapping)
 
-            model.measure.set_v_c_reg_mapping(
-                get_v_c_reg_mapping(circ_transpiled))
-            model.q_layer = q_layer
+    if cfg.model.load_op_list:
+        operation_list = checkpoint.get("q_layer_op_list")
+        if operation_list is None:
+            raise ValueError("Checkpoint has no q_layer_op_list")
+        model.q_layer = build_module_from_op_list(operation_list)
+    return dict(checkpoint), solution, score
 
-            if configs.trainer.add_noise:
-                # noise-aware training
-                noise_model_tq = builder.make_noise_model_tq()
-                noise_model_tq.is_add_noise = True
-                noise_model_tq.v_c_reg_mapping = get_v_c_reg_mapping(
-                    circ_transpiled)
-                noise_model_tq.p_c_reg_mapping = get_p_c_reg_mapping(
-                    circ_transpiled)
-                noise_model_tq.p_v_reg_mapping = get_p_v_reg_mapping(
-                    circ_transpiled)
-                model.set_noise_model_tq(noise_model_tq)
 
-        elif getattr(model, 'nodes', None) is not None:
-            # every node has a noise model because it is possible that
-            # different nodes run on different QC
-            for node in model.nodes:
-                circ = tq2qiskit(node.q_device, node.q_layer)
-                circ.measure(list(range(node.q_device.n_wires)),
-                             list(range(node.q_device.n_wires)))
-                circ_transpiled = processor.transpile(circs=circ)
-                q_layer = qiskit2tq(circ=circ_transpiled)
+def make_qiskit_processor(cfg: Any) -> QiskitProcessor:
+    """Build a processor using arguments supported by the current API."""
+    return QiskitProcessor(
+        use_real_qc=bool(cfg.qiskit.use_real_qc),
+        backend_name=cfg.qiskit.backend_name,
+        noise_model_name=cfg.qiskit.noise_model_name,
+        n_shots=int(cfg.qiskit.n_shots),
+        initial_layout=cfg.qiskit.initial_layout,
+        seed_transpiler=int(cfg.qiskit.seed_transpiler),
+        seed_simulator=int(cfg.qiskit.seed_simulator),
+        optimization_level=int(cfg.qiskit.optimization_level),
+        max_jobs=int(cfg.qiskit.max_jobs),
+    )
 
-                node.measure.set_v_c_reg_mapping(
-                    get_v_c_reg_mapping(circ_transpiled))
-                node.q_layer = q_layer
 
-                if configs.trainer.add_noise:
-                    # noise-aware training
-                    noise_model_tq = builder.make_noise_model_tq()
-                    noise_model_tq.is_add_noise = True
-                    noise_model_tq.v_c_reg_mapping = get_v_c_reg_mapping(
-                        circ_transpiled)
-                    noise_model_tq.p_c_reg_mapping = get_p_c_reg_mapping(
-                        circ_transpiled)
-                    noise_model_tq.p_v_reg_mapping = get_p_v_reg_mapping(
-                        circ_transpiled)
-                    node.set_noise_model_tq(noise_model_tq)
+def transpile_model_if_requested(
+    model: torch.nn.Module,
+    cfg: Any,
+    solution: Any,
+) -> None:
+    """Transpile quantum layers and update logical/physical register mappings."""
+    if not cfg.model.transpile_before_run:
+        return
 
-    if getattr(configs.model.arch, 'sample_arch', None) is not None and \
-            not configs.model.transpile_before_run:
-        sample_arch = configs.model.arch.sample_arch
-        logger.warning(f"Setting sample arch {sample_arch} from config file!")
-        if isinstance(sample_arch, str):
-            # this is the name of arch
-            sample_arch = get_named_sample_arch(model.arch_space, sample_arch)
-            logger.warning(f"Decoded sample arch: {sample_arch}")
-        model.set_sample_arch(sample_arch)
+    processor = make_qiskit_processor(cfg)
+    modules = [model] if hasattr(model, "q_layer") else list(model.nodes)
+    for module in modules:
+        circuit = tq2qiskit(module.q_device, module.q_layer)
+        wires = list(range(module.q_device.n_wires))
+        circuit.measure(wires, wires)
+        if solution is not None:
+            processor.set_layout(solution["layout"])
+        transpiled_circuit = processor.transpile(circuit)
+        module.q_layer = qiskit2tq(circ=transpiled_circuit)
+        register_mapping = get_v_c_reg_mapping(transpiled_circuit)
+        module.measure.set_v_c_reg_mapping(register_mapping)
 
-    if configs.trainer.name == 'pruning_trainer':
-        """
-        in pruning, convert the super layers to module list, otherwise the 
-        pruning ratio is difficulty to set
-        """
-        logger.warning(f"Convert sampled layer to module list layer!")
+        if cfg.trainer.add_noise:
+            noise_model = builder.make_noise_model_tq()
+            noise_model.is_add_noise = True
+            noise_model.v_c_reg_mapping = register_mapping
+            noise_model.p_c_reg_mapping = get_p_c_reg_mapping(
+                transpiled_circuit
+            )
+            noise_model.p_v_reg_mapping = get_p_v_reg_mapping(
+                transpiled_circuit
+            )
+            module.set_noise_model_tq(noise_model)
+
+
+def configure_sample_architecture(model: torch.nn.Module, cfg: Any) -> None:
+    """Apply an optional fixed architecture from configuration."""
+    sample_architecture = getattr(cfg.model.arch, "sample_arch", None)
+    if sample_architecture is None or cfg.model.transpile_before_run:
+        return
+    if isinstance(sample_architecture, str):
+        sample_architecture = get_named_sample_arch(
+            model.arch_space,
+            sample_architecture,
+        )
+    model.set_sample_arch(sample_architecture)
+    logger.info(f"Using fixed sample architecture: {sample_architecture}")
+
+
+def configure_pruning_model(model: torch.nn.Module, cfg: Any) -> None:
+    """Convert a sampled super layer for pruning-aware training when requested."""
+    if cfg.trainer.name == "pruning_trainer":
         model.q_layer = build_module_from_op_list(
             build_module_op_list(model.q_layer)
         )
 
-    model.to(device) # Since our model is an object of nn.Module this is meaningful. 
-    # model = torch.nn.parallel.DistributedDataParallel(
-    #     model.cuda(),
-    #     device_ids=[dist.local_rank()],
-    #     find_unused_parameters=True)
-    # if getattr(model, 'sample_arch', None) is not None and \
-    #         not configs.model.transpile_before_run and \
-    #         not configs.trainer.name == 'pruning_trainer':
-        # n_params = model.count_sample_params()
-        # logger.info(f"Number of sampled params: {n_params}")
 
-    total_params = sum(p.numel() for p in model.parameters())
-    logger.info(f'Model Size: {total_params}')
-
-    # logger.info(f'Model MACs: {profile_macs(model, inputs)}')
-
+def build_training_components(
+    model: torch.nn.Module,
+) -> tuple[Any, Any, Any, Any]:
+    """Construct the configured criterion, optimizer, scheduler, and trainer."""
     criterion = builder.make_criterion()
     optimizer = builder.make_optimizer(model)
     scheduler = builder.make_scheduler(optimizer)
@@ -278,19 +304,126 @@ def main() -> None:
         model=model,
         criterion=criterion,
         optimizer=optimizer,
-        scheduler=scheduler
+        scheduler=scheduler,
     )
+    return criterion, optimizer, scheduler, trainer
+
+
+def run_smoke_test(cfg: Any, device: torch.device) -> None:
+    """Run one sampled optimization step and verify checkpoint compatibility."""
+    model = builder.make_model().to(device)
+    gene = [choices[0] for choices in model.arch_space]
+    model.set_sample_arch(gene)
+    optimizer = builder.make_optimizer(model)
+    inputs = torch.randn(3, 1, 28, 28, device=device)
+    targets = torch.tensor([0, 1, 2], device=device)
+
+    optimizer.zero_grad(set_to_none=True)
+    outputs = model(inputs)
+    if outputs.shape != (3, 4):
+        raise RuntimeError(f"Unexpected supercircuit output shape: {outputs.shape}")
+    loss = F.nll_loss(outputs, targets)
+    loss.backward()
+    optimizer.step()
+
+    search_model = SuperQFCModel(copy.deepcopy(cfg.model.arch)).to(device)
+    search_model.set_sample_arch(gene)
+    incompatible = search_model.load_state_dict(
+        portable_state_dict(model),
+        strict=False,
+    )
+    if incompatible.missing_keys:
+        raise RuntimeError(
+            f"Search model is missing checkpoint keys: {incompatible.missing_keys}"
+        )
+    unsupported_keys = [
+        key
+        for key in incompatible.unexpected_keys
+        if not key.endswith((".U3_params", ".CU3_params"))
+    ]
+    if unsupported_keys:
+        raise RuntimeError(
+            f"Search model rejected checkpoint keys: {unsupported_keys}"
+        )
+    with torch.no_grad():
+        search_outputs = search_model(inputs)
+    if search_outputs.shape != outputs.shape:
+        raise RuntimeError("Search model rejected the trained checkpoint state")
+    if not torch.isfinite(search_outputs).all():
+        raise RuntimeError("Checkpoint compatibility check produced invalid output")
+
+    logger.info(
+        f"Supercircuit smoke test passed on {device} "
+        f"(gene={gene}, loss={loss.item():.6f})."
+    )
+
+
+def run_training(
+    cfg: Any,
+    args: argparse.Namespace,
+    device: torch.device,
+) -> None:
+    """Build all configured components and train the supercircuit."""
+    run_dir = args.run_dir or default_run_dir(args.config)
+    set_run_dir(str(run_dir))
+    logger.info(f"Training command: {' '.join([sys.executable] + sys.argv)}")
+    displayed_config = (
+        cfg if args.print_configs else get_cared_configs(cfg, "train")
+    )
+    logger.info(f"Training started in {run_dir}:\n{displayed_config}")
+
+    dataflow = build_dataflow(cfg, args.num_workers)
+    model = builder.make_model()
+    checkpoint_state: dict[str, Any] = {}
+    solution = None
+    score = None
+    if cfg.ckpt.load_ckpt:
+        checkpoint_path = resolve_checkpoint_path(
+            args.checkpoint_dir,
+            cfg.ckpt.name,
+        )
+        checkpoint_state, solution, score = load_training_checkpoint(
+            model,
+            checkpoint_path,
+            cfg,
+        )
+
+    transpile_model_if_requested(model, cfg, solution)
+    configure_sample_architecture(model, cfg)
+    configure_pruning_model(model, cfg)
+    model.to(device)
+    logger.info(
+        f"Trainable parameters: "
+        f"{sum(parameter.numel() for parameter in model.parameters())}"
+    )
+
+    _, _, _, trainer = build_training_components(model)
     trainer.solution = solution
     trainer.score = score
-
-    # trainer state_dict will be loaded in a callback
-    callbacks = builder.make_callbacks(dataflow, state_dict)
-
+    callbacks = builder.make_callbacks(dataflow, checkpoint_state)
     trainer.train_with_defaults(
-        dataflow['train'],
-        num_epochs=configs.run.n_epochs,
-        callbacks=callbacks)
+        dataflow["train"],
+        num_epochs=int(cfg.run.n_epochs),
+        callbacks=callbacks,
+    )
 
 
-if __name__ == '__main__':
+def main() -> None:
+    """Load configuration and run a smoke test or full training."""
+    args, overrides = parse_args()
+    configs.load(args.config, recursive=True)
+    configs.update(overrides)
+    if isinstance(configs.optimizer.lr, str):
+        configs.optimizer.lr = float(configs.optimizer.lr)
+    if args.pdb or configs.debug.pdb:
+        breakpoint()
+
+    device = configure_runtime(configs, args.gpu)
+    if args.smoke_test:
+        run_smoke_test(configs, device)
+    else:
+        run_training(configs, args, device)
+
+
+if __name__ == "__main__":
     main()

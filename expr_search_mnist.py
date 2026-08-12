@@ -1,515 +1,715 @@
+"""Expressibility-guided architecture search for a four-class MNIST QNN.
+
+The experiment compares randomly sampled quantum circuits with circuits selected
+by an evolutionary search that minimizes expressibility KL divergence. Candidate
+circuits are trained once on an ideal simulator, selected on validation accuracy,
+and then evaluated with several IBM fake-backend noise models.
+
+Run the inexpensive integration check before starting the full experiment::
+
+    python expr_search_mnist.py --smoke-test
+"""
+
+from __future__ import annotations
+
 import argparse
-import os
+import copy
+import random
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Callable, Sequence
+
 import numpy as np
 import torch
-import torch.backends.cudnn
-import torch.cuda
-import torch.nn
-import torch.utils.data
+import torch.nn.functional as F
 import torchquantum as tq
 import tqdm
-import random
-import copy
-
+from qiskit_aer import AerSimulator
+from qiskit_aer.noise import NoiseModel
+from qiskit_ibm_runtime.fake_provider import (
+    FakeManilaV2,
+    FakeTorino,
+    FakeYorktownV2,
+)
 from torchpack.environ import set_run_dir
 from torchpack.utils.config import configs
 from torchpack.utils.logging import logger
-from torchquantum.dataset import MNIST
-from expressibility_both_case import compute_expressibility_without_noise
-from torchquantum.plugin.qiskit.qiskit_processor import QiskitProcessor
 
-from datetime import datetime
-print(f"Using torchquantum from: {os.path.dirname(tq.__file__)}")
-
-from torchquantum.encoding import encoder_op_list_name_dict
+from quantum_expressibility import estimate_ideal_expressibility
 from torchquantum.algorithm.quantumnas.super_layers import super_layer_name_dict
-import torch.nn.functional as F
+from torchquantum.dataset import MNIST
+from torchquantum.encoding import encoder_op_list_name_dict
 from torchquantum.plugin import (
-    tq2qiskit_measurement,
-    qiskit_assemble_circs,
     op_history2qiskit,
     op_history2qiskit_expand_params,
+    qiskit_assemble_circs,
+    tq2qiskit_measurement,
 )
-
-from qiskit_ibm_runtime.fake_provider import FakeYorktownV2, FakeTorino, FakeManilaV2
-from qiskit_aer.noise import NoiseModel
-
-# **Load configs**
-# The config file describes everything about the model structure.
-
-parser = argparse.ArgumentParser()
-parser.add_argument("--config", default="configs_mnist.yaml")
-args = parser.parse_args()
-
-configs.load(args.config)
-
-if configs.debug.set_seed:
-    torch.manual_seed(configs.debug.seed)
-    np.random.seed(configs.debug.seed)
-
-    torch.cuda.manual_seed_all(configs.debug.seed)
-    # torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    # torch.use_deterministic_algorithms(True)
+from torchquantum.plugin.qiskit.qiskit_processor import QiskitProcessor
 
 
-class SuperQFCModel0(tq.QuantumModule):
-    def __init__(self, arch):
+Gene = list[int]
+StateDict = dict[str, torch.Tensor]
+AccuracyPredictor = Callable[..., float]
+ExpressibilityPredictor = Callable[..., float]
+
+DIGITS_OF_INTEREST = (0, 1, 2, 3)
+N_TRAIN_SAMPLES = 5_000
+N_VALID_SAMPLES = 3_000
+N_TEST_SAMPLES = 300
+EVALUATION_INTERVAL = 5
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", default="configs_mnist.yaml")
+    parser.add_argument(
+        "--smoke-test",
+        action="store_true",
+        help="Run a tiny clean/noisy integration check without loading MNIST.",
+    )
+    return parser.parse_args()
+
+
+def configure_runtime(cfg: Any) -> torch.device:
+    """Seed random generators and select the requested compute device."""
+    if cfg.debug.set_seed:
+        seed = int(cfg.debug.seed)
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        torch.backends.cudnn.benchmark = False
+
+    if cfg.run.device == "gpu" and torch.cuda.is_available():
+        return torch.device("cuda")
+
+    if cfg.run.device == "gpu":
+        logger.warning("GPU was requested but CUDA is unavailable; using CPU.")
+    return torch.device("cpu")
+
+
+def build_dataflow(cfg: Any, device: torch.device) -> dict[str, Any]:
+    """Create reproducible MNIST train, validation, and test loaders."""
+    return build_mnist_dataflow(cfg, device)
+
+
+def build_mnist_dataflow(
+    cfg: Any,
+    device: torch.device,
+    *,
+    fashion: bool = False,
+    data_root: str = "./mnist_data",
+    num_workers: int | None = None,
+) -> dict[str, Any]:
+    """Create reproducible MNIST-family data loaders."""
+    dataset = MNIST(
+        root=data_root,
+        train_valid_split_ratio=[0.9, 0.1],
+        digits_of_interest=DIGITS_OF_INTEREST,
+        n_train_samples=N_TRAIN_SAMPLES,
+        n_valid_samples=N_VALID_SAMPLES,
+        n_test_samples=N_TEST_SAMPLES,
+        fashion=fashion,
+    )
+
+    train_generator = torch.Generator().manual_seed(int(cfg.debug.seed))
+    loader_workers = (
+        int(cfg.run.workers_per_gpu)
+        if num_workers is None
+        else int(num_workers)
+    )
+    if loader_workers < 0:
+        raise ValueError("num_workers cannot be negative")
+    loaders = {}
+    for split in dataset:
+        is_training = split == "train"
+        loaders[split] = torch.utils.data.DataLoader(
+            dataset[split],
+            batch_size=int(cfg.run.bsz),
+            shuffle=is_training,
+            generator=train_generator if is_training else None,
+            num_workers=loader_workers,
+            pin_memory=device.type == "cuda",
+        )
+    return loaders
+
+
+class SuperQFCModel(tq.QuantumModule):
+    """A searchable quantum fully connected classifier."""
+
+    def __init__(self, arch: Any) -> None:
         super().__init__()
         self.arch = arch
-        self.n_wires = arch['n_wires']
-        # self.q_device = tq.QuantumDevice(n_wires=self.n_wires)
+        self.n_wires = int(arch["n_wires"])
         self.encoder = tq.GeneralEncoder(
-            encoder_op_list_name_dict[arch['encoder_op_list_name']]
+            encoder_op_list_name_dict[arch["encoder_op_list_name"]]
         )
-        self.q_layer = super_layer_name_dict[arch['q_layer_name']](arch)
+        self.q_layer = super_layer_name_dict[arch["q_layer_name"]](arch)
         self.measure = tq.MeasureAll(tq.PauliZ)
-        self.sample_arch = None
+        self.sample_arch: Sequence[int] | None = None
 
-    def set_sample_arch(self, sample_arch):
+    def set_sample_arch(self, sample_arch: Sequence[int]) -> None:
         self.sample_arch = sample_arch
         self.q_layer.set_sample_arch(sample_arch)
 
-    def count_sample_params(self):
+    def count_sample_params(self) -> int:
         return self.q_layer.count_sample_params()
 
-    def forward(self, x, verbose=False, use_qiskit=False):
-        bsz = x.shape[0]
-        qdev = tq.QuantumDevice(n_wires=self.n_wires, bsz=bsz, record_op=True, device=x.device)
-        # self.q_device.reset_states(bsz=bsz)
+    def forward(
+        self,
+        x: torch.Tensor,
+        verbose: bool = False,
+        use_qiskit: bool = False,
+    ) -> torch.Tensor:
+        batch_size = x.shape[0]
+        q_device = tq.QuantumDevice(
+            n_wires=self.n_wires,
+            bsz=batch_size,
+            record_op=True,
+            device=x.device,
+        )
 
-        if getattr(self.arch, 'down_sample_kernel_size', None) is not None:
-            x = F.avg_pool2d(x, self.arch['down_sample_kernel_size'])
-
-        x = x.view(bsz, -1)
+        kernel_size = getattr(self.arch, "down_sample_kernel_size", None)
+        if kernel_size is not None:
+            x = F.avg_pool2d(x, kernel_size)
+        x = x.reshape(batch_size, -1)
 
         if use_qiskit:
-            # use qiskit to process the circuit
-            # create the qiskit circuit for encoder
-            self.encoder(qdev, x)
-            op_history_parameterized = qdev.op_history
-            qdev.reset_op_history()
-            encoder_circs = op_history2qiskit_expand_params(self.n_wires, op_history_parameterized, bsz=bsz)
-
-            # create the qiskit circuit for trainable quantum layers
-            self.q_layer(qdev)
-            op_history_fixed = qdev.op_history
-            qdev.reset_op_history()
-            q_layer_circ = op_history2qiskit(self.n_wires, op_history_fixed)
-
-            # create the qiskit circuit for measurement
-            measurement_circ = tq2qiskit_measurement(qdev, self.measure)
-
-            # assemble the encoder, trainable quantum layers, and measurement circuits
-            assembled_circs = qiskit_assemble_circs(
-                encoder_circs, q_layer_circ, measurement_circ
-            )
-
-            # call the qiskit processor to process the circuit
-            x0 = self.qiskit_processor.process_ready_circs(qdev, assembled_circs, parallel=True).to(  # type: ignore
-                x.device
-            )
-            x = x0
-
+            x = self._forward_qiskit(q_device, x)
         else:
-            self.encoder(qdev, x)
-            self.q_layer(qdev)
-            x = self.measure(qdev)
+            self.encoder(q_device, x)
+            self.q_layer(q_device)
+            x = self.measure(q_device)
 
         if verbose:
-            logger.info(f"[use_qiskit]={use_qiskit}, expectation:\n {x.data}")
+            logger.info(f"[use_qiskit]={use_qiskit}, expectation:\n{x.data}")
 
-        if getattr(self.arch, 'output_len', None) is not None:
-            x = x.reshape(bsz, -1, self.arch.output_len).sum(-1)
+        output_len = getattr(self.arch, "output_len", None)
+        if output_len is not None:
+            x = x.reshape(batch_size, -1, output_len).sum(-1)
+        elif x.ndim > 2:
+            x = x.reshape(batch_size, -1)
 
-        if x.dim() > 2:
-            x = x.squeeze()
+        return F.log_softmax(x, dim=1)
 
-        x = F.log_softmax(x, dim=1)
-        return x
+    def _forward_qiskit(
+        self,
+        q_device: tq.QuantumDevice,
+        x: torch.Tensor,
+    ) -> torch.Tensor:
+        """Execute the encoded circuit through the configured Qiskit processor."""
+        if self.qiskit_processor is None:
+            raise RuntimeError("A Qiskit processor must be set before noisy inference.")
+
+        batch_size = x.shape[0]
+        self.encoder(q_device, x)
+        encoder_history = q_device.op_history
+        q_device.reset_op_history()
+        encoder_circuits = op_history2qiskit_expand_params(
+            self.n_wires,
+            encoder_history,
+            bsz=batch_size,
+        )
+
+        self.q_layer(q_device)
+        layer_history = q_device.op_history
+        q_device.reset_op_history()
+        layer_circuit = op_history2qiskit(self.n_wires, layer_history)
+        measurement_circuit = tq2qiskit_measurement(q_device, self.measure)
+        circuits = qiskit_assemble_circs(
+            encoder_circuits,
+            layer_circuit,
+            measurement_circuit,
+        )
+        return self.qiskit_processor.process_ready_circs(
+            q_device,
+            circuits,
+            parallel=False,
+        ).to(x.device)
 
     @property
-    def arch_space(self):
-        space = []
-        for layer in self.q_layer.super_layers_all:
-            space.append(layer.arch_space)
-        # for the number of sampled blocks
-        space.append(list(range(self.q_layer.n_front_share_blocks,
-                                self.q_layer.n_blocks + 1)))
+    def arch_space(self) -> list[list[int]]:
+        """Return the discrete search choices for each gene position."""
+        space = [layer.arch_space for layer in self.q_layer.super_layers_all]
+        space.append(
+            list(
+                range(
+                    self.q_layer.n_front_share_blocks,
+                    self.q_layer.n_blocks + 1,
+                )
+            )
+        )
         return space
 
 
-
-
-
-print(f"Using torchquantum from: {os.path.dirname(tq.__file__)}")
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-if isinstance(configs.optimizer.lr, str):
-    configs.optimizer.lr = eval(configs.optimizer.lr)
-dataset = MNIST(
-    root='./mnist_data',
-    train_valid_split_ratio=[0.9, 0.1],
-    digits_of_interest=[0, 1, 2, 3],
-    n_test_samples=300,
-    n_train_samples=5000,
-    n_valid_samples=3000,
-)
-
-g = torch.Generator()
-g.manual_seed(configs.debug.seed)
-dataflow = dict()
-for split in dataset:
-    sampler = torch.utils.data.RandomSampler(dataset[split], generator=g)
-    dataflow[split] = torch.utils.data.DataLoader(
-        dataset[split],
-        batch_size=configs.run.bsz,
-        sampler=sampler,
-        num_workers=configs.run.workers_per_gpu,
-        pin_memory=True)
-
-
-
-def log_acc(output_all, target_all, k=1):
-    _, indices = output_all.topk(k, dim=1)
-    masks = indices.eq(target_all.view(-1, 1).expand_as(indices))
-    size = target_all.shape[0]
-    corrects = masks.sum().item()
-    accuracy = corrects / size
-    loss = F.nll_loss(output_all, target_all).item()
-    logger.info(f"Accuracy: {accuracy}")
-    logger.info(f"Loss: {loss}")
-    return accuracy, loss
-
-
-
-def evaluate_gene_model(model, gene=None, use_qiskit=False):
-    if gene is not None:
-        model.set_sample_arch(gene)
-    with torch.no_grad():
-        target_all = []
-        output_all = []
-        for feed_dict in tqdm.tqdm(dataflow['test']):
-            if configs.run.device == 'gpu':
-                inputs = feed_dict[configs.dataset.input_name].cuda(non_blocking=True)
-                targets = feed_dict[configs.dataset.target_name].cuda(non_blocking=True)
-            else:
-                inputs = feed_dict[configs.dataset.input_name]
-                targets = feed_dict[configs.dataset.target_name]
-
-            outputs = model(inputs, use_qiskit=use_qiskit)
-            target_all.append(targets)
-            output_all.append(outputs)
-
-        target_all = torch.cat(target_all, dim=0)
-        output_all = torch.cat(output_all, dim=0)
-    accuracy, loss = log_acc(output_all, target_all)
-
-    return accuracy, loss
-
-
-
 def build_model_for_gene(
-    gene,
-    noisy_backend,
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-):
-   
-    model = SuperQFCModel0(
-        copy.deepcopy(configs.model.arch)
-    )
-
-    noise_model = NoiseModel.from_backend(noisy_backend)
-
-    processor_real_qc = QiskitProcessor(
-    use_real_qc=False,                  # simulate, not run on real QC
-    noise_model=noise_model,    # IBM backend to pull noise from
-    ibm_quantum_token="---", # your IBM Quantum API token
-)
-    model.set_qiskit_processor(processor_real_qc)
-
-    model.to(device)
-
+    cfg: Any,
+    gene: Sequence[int],
+    device: torch.device,
+    noisy_backend: Any | None = None,
+    n_shots: int | None = None,
+) -> SuperQFCModel:
+    """Build a fixed candidate model, optionally with a noisy Qiskit processor."""
+    model = SuperQFCModel(copy.deepcopy(cfg.model.arch))
     model.set_sample_arch(gene)
 
-    return model
+    if noisy_backend is not None:
+        noise_model = NoiseModel.from_backend(noisy_backend)
+        processor = QiskitProcessor(
+            use_real_qc=False,
+            noise_model=noise_model,
+            n_shots=int(n_shots or cfg.qiskit.n_shots),
+            seed_transpiler=int(cfg.qiskit.seed_transpiler),
+            seed_simulator=int(cfg.qiskit.seed_simulator),
+            optimization_level=int(cfg.qiskit.optimization_level),
+        )
+        # Use the fake backend as the transpilation target so its topology and
+        # native gates are respected without passing conflicting options.
+        processor.backend = AerSimulator.from_backend(noisy_backend)
+        model.set_qiskit_processor(processor)
+
+    return model.to(device)
 
 
+def compute_metrics(
+    outputs: torch.Tensor,
+    targets: torch.Tensor,
+) -> tuple[float, float]:
+    """Compute and log top-1 accuracy and negative log-likelihood."""
+    predictions = outputs.argmax(dim=1)
+    accuracy = predictions.eq(targets).float().mean().item()
+    loss = F.nll_loss(outputs, targets).item()
+    logger.info(f"Accuracy: {accuracy:.6f}")
+    logger.info(f"Loss: {loss:.6f}")
+    return accuracy, loss
 
 
+def portable_state_dict(model: SuperQFCModel) -> StateDict:
+    """Copy model weights while excluding TorchQuantum's runtime buffers."""
+    return {
+        name: value.detach().cpu().clone()
+        for name, value in model.state_dict().items()
+        if ".q_device." not in name
+    }
 
-def train_subcircuit_simple(
-    gene,
-    noisy_backend,
-    n_epochs=5,
-    lr=1e-3,
-    weight_decay=1e-4,
-    use_qiskit_eval=True,
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-    verbose=False,
-):
-    """
-    Train a fixed subcircuit (gene) and return the best accuracy during training.
-    """
-    # -------------------------
-    # Build model
-    # -------------------------
-    model = build_model_for_gene(gene, noisy_backend, device=device)
-    model.train()
 
+def evaluate_gene_model(
+    cfg: Any,
+    model: SuperQFCModel,
+    gene: Sequence[int],
+    dataflow: dict[str, Any],
+    split: str,
+    device: torch.device,
+    use_qiskit: bool = False,
+    max_samples: int | None = None,
+) -> tuple[float, float]:
+    """Evaluate a candidate while preserving its previous train/eval mode."""
+    if split not in dataflow:
+        raise ValueError(f"Unknown data split: {split!r}")
+    if max_samples is not None and max_samples < 1:
+        raise ValueError("max_samples must be at least 1")
+
+    model.set_sample_arch(gene)
+    was_training = model.training
+    model.eval()
+    try:
+        all_targets = []
+        all_outputs = []
+        samples_seen = 0
+        with torch.no_grad():
+            for batch in tqdm.tqdm(dataflow[split], desc=f"Evaluating {split}"):
+                inputs = batch[cfg.dataset.input_name].to(
+                    device,
+                    non_blocking=device.type == "cuda",
+                )
+                targets = batch[cfg.dataset.target_name].to(
+                    device,
+                    non_blocking=device.type == "cuda",
+                )
+                if max_samples is not None:
+                    remaining = max_samples - samples_seen
+                    if remaining <= 0:
+                        break
+                    inputs = inputs[:remaining]
+                    targets = targets[:remaining]
+
+                all_outputs.append(model(inputs, use_qiskit=use_qiskit))
+                all_targets.append(targets)
+                samples_seen += targets.shape[0]
+
+        return compute_metrics(
+            torch.cat(all_outputs, dim=0),
+            torch.cat(all_targets, dim=0),
+        )
+    finally:
+        model.train(was_training)
+
+
+def train_gene(
+    cfg: Any,
+    gene: Sequence[int],
+    dataflow: dict[str, Any],
+    device: torch.device,
+    verbose: bool = False,
+) -> StateDict:
+    """Train one gene and return the weights with best validation accuracy."""
+    n_epochs = int(cfg.run.n_epochs)
+    if n_epochs < 1:
+        raise ValueError("configs.run.n_epochs must be at least 1")
+
+    model = build_model_for_gene(cfg, gene, device)
     optimizer = torch.optim.Adam(
         model.parameters(),
-        lr=lr,
-        weight_decay=weight_decay,
+        lr=float(cfg.optimizer.lr),
+        weight_decay=float(cfg.optimizer.weight_decay),
     )
-
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=n_epochs)
-
+        optimizer,
+        T_max=n_epochs,
+    )
     criterion = torch.nn.NLLLoss()
 
-    best_acc = -1.0
-    eval_interval = 5  # or even 10
+    best_accuracy = -1.0
+    best_state: StateDict | None = None
+    last_validation_accuracy = float("nan")
 
-    # -------------------------
-    # Training loop
-    # -------------------------
     for epoch in range(n_epochs):
         model.train()
-        epoch_loss = 0.0
-        # eval_interval = 5  # or even 10
+        total_loss = 0.0
+        for batch in dataflow["train"]:
+            inputs = batch[cfg.dataset.input_name].to(
+                device,
+                non_blocking=device.type == "cuda",
+            )
+            targets = batch[cfg.dataset.target_name].to(
+                device,
+                non_blocking=device.type == "cuda",
+            )
 
-        for feed_dict in dataflow['train']:
-            inputs = feed_dict[configs.dataset.input_name].cuda(non_blocking=True)
-            targets = feed_dict[configs.dataset.target_name].cuda(non_blocking=True)
-
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
-
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
+            loss = criterion(model(inputs), targets)
             loss.backward()
             optimizer.step()
+            total_loss += loss.item()
 
-            epoch_loss += loss.item()
-
-        epoch_loss /= len(dataflow['train'])
-
-        # -------------------------
-        # Evaluation
-        # -------------------------
-        if epoch % eval_interval == 0 or epoch == n_epochs-1:
-            acc, _ = evaluate_gene_model(
+        should_evaluate = (
+            epoch % EVALUATION_INTERVAL == 0 or epoch == n_epochs - 1
+        )
+        if should_evaluate:
+            last_validation_accuracy, _ = evaluate_gene_model(
+                cfg,
                 model,
-                gene=gene,
-                use_qiskit=use_qiskit_eval,
+                gene,
+                dataflow,
+                split="valid",
+                device=device,
             )
-            if acc > best_acc:
-                best_acc = acc
+            if last_validation_accuracy > best_accuracy:
+                best_accuracy = last_validation_accuracy
+                best_state = portable_state_dict(model)
 
         scheduler.step()
-
         if verbose:
-            print(
-                f"[Epoch {epoch:02d}] "
-                f"Loss={epoch_loss:.4f}, "
-                f"Acc={acc:.4f}, "
-                f"Best={best_acc:.4f}"
+            mean_loss = total_loss / len(dataflow["train"])
+            logger.info(
+                f"Epoch {epoch + 1:03d} | loss {mean_loss:.4f} | "
+                f"validation {last_validation_accuracy:.4f} | "
+                f"best {best_accuracy:.4f}"
             )
 
-    # # -------------------------
-    # # Restore best model (optional)
-    # # -------------------------
-    # model.load_state_dict(best_state)
-
-    return best_acc
+    if best_state is None:
+        raise RuntimeError("Training completed without producing a model state.")
+    return best_state
 
 
+def make_accuracy_predictor(
+    cfg: Any,
+    dataflow: dict[str, Any],
+    device: torch.device,
+) -> AccuracyPredictor:
+    """Create an evaluator that trains each unique gene exactly once."""
+    trained_states: dict[tuple[int, ...], StateDict] = {}
+
+    def predict(
+        gene: Sequence[int],
+        noisy_backend: Any | None = None,
+        use_qiskit: bool = True,
+    ) -> float:
+        key = tuple(gene)
+        if key not in trained_states:
+            trained_states[key] = train_gene(cfg, gene, dataflow, device)
+
+        model = build_model_for_gene(
+            cfg,
+            gene,
+            device,
+            noisy_backend=noisy_backend if use_qiskit else None,
+        )
+        model.load_state_dict(trained_states[key])
+        accuracy, _ = evaluate_gene_model(
+            cfg,
+            model,
+            gene,
+            dataflow,
+            split="test",
+            device=device,
+            use_qiskit=use_qiskit,
+        )
+        return accuracy
+
+    return predict
 
 
-def accuracy_predictor(gene, noisy_backend=None, use_qiskit=True):
-    best_acc = train_subcircuit_simple(
-        gene=gene,
-        noisy_backend=noisy_backend,
-        n_epochs=configs.run.n_epochs,
-        lr=configs.optimizer.lr,
-        use_qiskit_eval=use_qiskit,
-        verbose=False,
-    )
-    return best_acc
+class EvolutionarySearcher:
+    """Simple elitist evolutionary search over discrete circuit genes."""
 
-
-
-class RandomAndEvolutionarySearcher:
-    def __init__(self,
-                 gene_choice,
-                 accuracy_predictor,
-                 expr_predictor,
-                 configs):
-        self.gene_choice = gene_choice
-        self.gene_len = len(self.gene_choice)
+    def __init__(
+        self,
+        gene_choices: Sequence[Sequence[int]],
+        accuracy_predictor: AccuracyPredictor,
+        expressibility_predictor: ExpressibilityPredictor,
+        cfg: Any,
+    ) -> None:
+        self.gene_choices = [list(choices) for choices in gene_choices]
         self.accuracy_predictor = accuracy_predictor
-        self.expr_predictor = expr_predictor
-        self.n_iterations = configs.es.n_iterations
-        self.parent_size = configs.es.parent_size
-        self.mutation_size = configs.es.mutation_size
-        self.mutation_prob = configs.es.mutation_prob
-        self.crossover_size = configs.es.crossover_size
+        self.expressibility_predictor = expressibility_predictor
+        self.n_qubits = int(cfg.model.arch.n_wires)
+        self.n_iterations = int(cfg.es.n_iterations)
+        self.parent_size = int(cfg.es.parent_size)
+        self.mutation_size = int(cfg.es.mutation_size)
+        self.mutation_probability = float(cfg.es.mutation_prob)
+        self.crossover_size = int(cfg.es.crossover_size)
+        self.expressibility_cache: dict[tuple[int, ...], float] = {}
+        self.population: list[Gene] = []
+        self.best_solution: Gene | None = None
 
-    def random_sample(self, sample_num):
-        # randomly sample genes
-        population = []
-        i = 0
-        while i < sample_num:
-            samp_gene = []
-            for k in range(self.gene_len):
-                samp_gene.append(random.choices(self.gene_choice[k])[0])
-            population.append(samp_gene)
-            i += 1
-        return population
+        if self.crossover_size and self.parent_size < 2:
+            raise ValueError("At least two parents are required for crossover.")
 
-    def ask(self):
-        """return the solutions"""
-        return self.population
+    def random_sample(self, sample_count: int) -> list[Gene]:
+        return [
+            [random.choice(choices) for choices in self.gene_choices]
+            for _ in range(sample_count)
+        ]
 
-    def select_and_transform(self, scores):
-        """perform evo search according to the scores"""
-        
-        # sort the index according to the scores (descending order)
-        sorted_idx = (-np.array(scores)).argsort()[:self.parent_size]
+    def expressibility_score(self, gene: Sequence[int]) -> float:
+        """Return negative KL divergence so that larger scores are better."""
+        key = tuple(gene)
+        if key not in self.expressibility_cache:
+            kl_divergence = self.expressibility_predictor(
+                gene,
+                n_qubits=self.n_qubits,
+            )
+            self.expressibility_cache[key] = -float(kl_divergence)
+        return self.expressibility_cache[key]
 
-        # hint: update self.best_solution and self.best_score
-        self.best_solution = self.population[sorted_idx[0]]
-        self.best_score = scores[sorted_idx[0]]
+    def select_and_transform(self, scores: Sequence[float]) -> None:
+        """Keep elite parents, then generate mutations and crossovers."""
+        if len(scores) != len(self.population):
+            raise ValueError("Every population member must have one score.")
 
-        self.best_solutions = [self.population[i] for i in sorted_idx]
-        self.best_scores = [scores[i] for i in sorted_idx]
+        parent_indices = np.argsort(-np.asarray(scores))[: self.parent_size]
+        parents = [self.population[index] for index in parent_indices]
+        self.best_solution = parents[0].copy()
 
-        parents = [self.population[i] for i in sorted_idx]
+        mutations = [
+            self.mutate(random.choice(parents))
+            for _ in range(self.mutation_size)
+        ]
+        crossovers = [
+            self.crossover(random.sample(parents, 2))
+            for _ in range(self.crossover_size)
+        ]
+        self.population = parents + mutations + crossovers
 
-        # mutation
-        mutate_population = []
-        k = 0
-        while k < self.mutation_size:
-            mutated_gene = self.mutate(random.choices(parents)[0])
-            mutate_population.append(mutated_gene)
-            k += 1
+    def mutate(self, gene: Sequence[int]) -> Gene:
+        return [
+            random.choice(self.gene_choices[index])
+            if random.random() < self.mutation_probability
+            else value
+            for index, value in enumerate(gene)
+        ]
 
-        # crossover
-        crossover_population = []
-        k = 0
-        while k < self.crossover_size:
-            crossovered_gene = self.crossover(random.sample(parents, 2))
-            crossover_population.append(crossovered_gene)
-            k += 1
+    def crossover(self, parents: Sequence[Sequence[int]]) -> Gene:
+        return [
+            parents[0][index] if random.random() < 0.5 else parents[1][index]
+            for index in range(len(self.gene_choices))
+        ]
 
-        self.population = parents + mutate_population + crossover_population
+    def search_best_expressibility(self, n_experiments: int) -> list[Gene]:
+        """Run independent searches and return the winner from each one."""
+        population_size = (
+            self.parent_size + self.mutation_size + self.crossover_size
+        )
+        winners = []
+        for _ in range(n_experiments):
+            self.population = self.random_sample(population_size)
+            for _ in range(self.n_iterations):
+                scores = [
+                    self.expressibility_score(gene) for gene in self.population
+                ]
+                self.select_and_transform(scores)
 
-    def crossover(self, genes):
-        crossovered_gene = []
-        for i in range(self.gene_len):
-            if np.random.uniform() < 0.5:
-                crossovered_gene.append(genes[0][i])
-            else:
-                crossovered_gene.append(genes[1][i])
-        return crossovered_gene
+            if self.best_solution is None:
+                raise RuntimeError("Evolutionary search produced no solution.")
+            winners.append(self.best_solution.copy())
+        return winners
 
-    def mutate(self, gene):
-        mutated_gene = []
-        for i in range(self.gene_len):        
-            # use np.random.uniform() to decide whether to mutate position i
-            # mutate ith position of gene with self.mutation_prob as mutation probability
-            if np.random.uniform() < self.mutation_prob:
-                mutated_gene.append(random.choices(self.gene_choice[i])[0])
-            else:
-                mutated_gene.append(gene[i])
-        return mutated_gene  
-    
-    def search_best_expr(self, n_experiments):
-        best_gene_list = []
+    def run(
+        self,
+        noisy_backends: Sequence[Any],
+        n_experiments: int,
+    ) -> dict[str, list[np.ndarray]]:
+        """Compare random and expressibility-guided genes on each backend."""
+        random_genes = self.random_sample(n_experiments)
+        evolved_genes = self.search_best_expressibility(n_experiments)
+        logger.info(f"Random genes: {random_genes}")
+        logger.info(f"Expressibility-guided genes: {evolved_genes}")
 
-        for i in range(n_experiments):
-            # NO seed reset here
-
-            self.population = self.random_sample(
-                self.parent_size + self.mutation_size + self.crossover_size
+        random_results = []
+        evolved_results = []
+        for backend in noisy_backends:
+            random_accuracies = np.asarray(
+                [
+                    self.accuracy_predictor(
+                        gene=gene,
+                        noisy_backend=backend,
+                        use_qiskit=True,
+                    )
+                    for gene in random_genes
+                ]
+            )
+            evolved_accuracies = np.asarray(
+                [
+                    self.accuracy_predictor(
+                        gene=gene,
+                        noisy_backend=backend,
+                        use_qiskit=True,
+                    )
+                    for gene in evolved_genes
+                ]
+            )
+            random_results.append(random_accuracies)
+            evolved_results.append(evolved_accuracies)
+            logger.info(
+                f"{backend.name} random accuracies: {random_accuracies} "
+                f"(mean {random_accuracies.mean():.4f})"
+            )
+            logger.info(
+                f"{backend.name} guided accuracies: {evolved_accuracies} "
+                f"(mean {evolved_accuracies.mean():.4f})"
             )
 
-            for _ in range(self.n_iterations):
-                expr_scores = [
-                    -self.expr_predictor(gene, n_qubits=4)
-                    for gene in self.population
-                ]
-                self.select_and_transform(expr_scores)
-
-            best_gene_list.append(self.best_solution)
-
-        return best_gene_list
-
-         
-    def run_search(self, noisy_backends, n_experiments):
-        randome_gene_list = self.random_sample(n_experiments) 
-        logger.info(f'random gene list is { randome_gene_list }')
-        best_gene_list = self.search_best_expr(n_experiments)
-        # best_gene_list = [[3, 1, 4, 4, 2, 4, 3]]
-        logger.info(f'expressive gene list is {best_gene_list}')
-        accs_random_all = []
-        accs_evo_all = []
-        for backend in noisy_backends:
-            accs_random = []
-            accs_evo = []
-            for gene in randome_gene_list:
-                acc_random = self.accuracy_predictor(
-                    gene=gene, noisy_backend = backend, use_qiskit=True
-                )
-                accs_random.append(acc_random)
-            accs_random = np.array(accs_random)
-            accs_random_all.append(accs_random)
-            logger.info(f'random accuracies for backend {backend.name } are: { accs_random} with mean { accs_random.mean()}')
-
-            for gene in best_gene_list:
-                acc_evo = self.accuracy_predictor(gene=gene, noisy_backend=backend, use_qiskit=True)
-                accs_evo.append(acc_evo)
-            accs_evo = np.array(accs_evo)
-            accs_evo_all.append(accs_evo)
-            logger.info(f'Expressibility guided accuracies for backend { backend.name } are: { accs_evo} with mean { accs_evo.mean()}')
+        return {"random": random_results, "evolutionary": evolved_results}
 
 
-        logger.info(f"Random accs: {accs_random_all}")
-        logger.info(f"Evo accs: {accs_evo_all}")
+def run_smoke_test(
+    cfg: Any,
+    device: torch.device,
+    dataset_label: str = "MNIST",
+) -> None:
+    """Exercise model construction, gradients, expressibility, and noisy inference."""
+    architecture_probe = SuperQFCModel(copy.deepcopy(cfg.model.arch))
+    gene = [choices[0] for choices in architecture_probe.arch_space]
+    inputs = torch.randn(2, 1, 28, 28, device=device)
+    targets = torch.tensor([0, 1], device=device)
+
+    model = build_model_for_gene(cfg, gene, device)
+    outputs = model(inputs)
+    if outputs.shape != (2, len(DIGITS_OF_INTEREST)):
+        raise RuntimeError(f"Unexpected clean output shape: {outputs.shape}")
+    F.nll_loss(outputs, targets).backward()
+
+    kl_divergence = estimate_ideal_expressibility(
+        gene,
+        n_qubits=int(cfg.model.arch.n_wires),
+        n_pairs=4,
+        n_bins=8,
+        seed=int(cfg.debug.seed),
+    )
+    if not np.isfinite(kl_divergence):
+        raise RuntimeError("Smoke-test expressibility is not finite.")
+
+    noisy_model = build_model_for_gene(
+        cfg,
+        gene,
+        device,
+        noisy_backend=FakeYorktownV2(),
+        n_shots=32,
+    )
+    noisy_model.load_state_dict(portable_state_dict(model))
+    noisy_model.eval()
+    with torch.no_grad():
+        noisy_outputs = noisy_model(inputs, use_qiskit=True)
+    if noisy_outputs.shape != outputs.shape or not torch.isfinite(noisy_outputs).all():
+        raise RuntimeError("Noisy inference returned invalid output.")
+
+    logger.info(
+        f"{dataset_label} smoke test passed on {device} "
+        f"(gene={gene}, KL={kl_divergence:.6f})."
+    )
 
 
-        return {
-            "random": accs_random_all,
-            "evolutionary": accs_evo_all,
-        }
+def run_experiment(
+    cfg: Any,
+    device: torch.device,
+    *,
+    fashion: bool = False,
+    data_root: str = "./mnist_data",
+    run_name_prefix: str = "expr_search_mnist",
+    dataset_label: str = "MNIST",
+) -> None:
+    """Build data and execute the complete architecture-search experiment."""
+    run_name = f"{run_name_prefix}_{datetime.now():%Y%m%d_%H%M%S}"
+    run_dir = Path("runs") / run_name
+    set_run_dir(str(run_dir))
+
+    dataflow = build_mnist_dataflow(
+        cfg,
+        device,
+        fashion=fashion,
+        data_root=data_root,
+    )
+    architecture_probe = SuperQFCModel(copy.deepcopy(cfg.model.arch))
+    gene_choices = architecture_probe.arch_space
+    noisy_backends = [FakeYorktownV2(), FakeTorino(), FakeManilaV2()]
+
+    logger.info(f"Run directory: {run_dir}")
+    logger.info(f"Dataset: {dataset_label}")
+    logger.info(f"TorchQuantum source: {Path(tq.__file__).resolve().parent}")
+    logger.info(f"Device: {device}")
+    logger.info(f"Seed: {cfg.debug.seed}")
+    logger.info(f"Epochs: {cfg.run.n_epochs}")
+    logger.info(f"Batch size: {cfg.run.bsz}")
+    logger.info(f"Gene choices: {gene_choices}")
+    logger.info(f"Noisy backends: {[backend.name for backend in noisy_backends]}")
+
+    searcher = EvolutionarySearcher(
+        gene_choices=gene_choices,
+        accuracy_predictor=make_accuracy_predictor(cfg, dataflow, device),
+        expressibility_predictor=estimate_ideal_expressibility,
+        cfg=cfg,
+    )
+    results = searcher.run(noisy_backends, n_experiments=5)
+    logger.info(f"Random results: {results['random']}")
+    logger.info(f"Evolutionary results: {results['evolutionary']}")
+
+
+def main() -> None:
+    """Load configuration and run either the smoke test or full experiment."""
+    args = parse_args()
+    configs.load(args.config)
+    if isinstance(configs.optimizer.lr, str):
+        configs.optimizer.lr = float(configs.optimizer.lr)
+    device = configure_runtime(configs)
+
+    if args.smoke_test:
+        run_smoke_test(configs, device)
+    else:
+        run_experiment(configs, device)
 
 
 if __name__ == "__main__":
-
-    run_name = f"expr_search_mnist_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    run_dir = f"runs/{run_name}"
-    set_run_dir(run_dir)
-
-    logger.info(f"Run directory set to: {run_dir}")
-
-    noisy_backends = [FakeYorktownV2(), FakeTorino(), FakeManilaV2()]
-
-    gene_choises = [[1, 2, 3, 4], [1, 2, 3, 4], [1, 2, 3, 4], [1, 2, 3, 4], [1, 2, 3, 4], [1, 2, 3, 4], [1, 2, 3]]
-    # model = SuperQFCModel0(configs.model.arch)
-
-    logger.info("========== EXPERIMENT METADATA ==========")
-    logger.info(f"Seed: {configs.debug.seed}")
-    logger.info(f"Epochs: {configs.run.n_epochs}")
-    logger.info(f"Batch size: {configs.run.bsz}")
-    logger.info(f"Gene choices: {gene_choises}")
-    logger.info(f"Noisy backends: {[b.name for b in noisy_backends]}")
-    logger.info("========================================")
-
-
-    agent = RandomAndEvolutionarySearcher(gene_choises, accuracy_predictor, compute_expressibility_without_noise, configs)
-
-    # get the accuracy and gene of the best subcircuit
-    results = agent.run_search(noisy_backends, n_experiments=5)
-
-    print("Random all accs:", results["random"])
-    print("Evo all accs:", results["evolutionary"])
-
+    main()

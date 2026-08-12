@@ -19,6 +19,7 @@ dataset:
   name: mnist
   input_name: image
   target_name: digit
+  fashion: True
 
 optimizer:
   name: adam

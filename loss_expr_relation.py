@@ -1,445 +1,359 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
+"""Study loss versus quantum-circuit expressibility on four-class MNIST.
+
+The script samples subcircuits from a pretrained supercircuit, evaluates their
+classification loss, estimates ideal and noisy expressibility, and exports the
+relationships as CSV files with Spearman rank-correlation summaries.
+
+Use validation data for exploratory analysis (the default). Reserve the test set
+for a final, pre-specified analysis::
+
+    python loss_expr_relation.py --population-size 100
+
+Run the lightweight integration check first::
+
+    python loss_expr_relation.py --smoke-test
 """
-Converted from Jupyter Notebook: notebook.ipynb
-Conversion Date: 2025-12-05T10:19:42.669Z
-"""
-# # Setup
+
+from __future__ import annotations
 
 import argparse
-import os
-os.environ['XLA_FLAGS'] = '--xla_gpu_cuda_data_dir=/usr/lib/cuda'
-import sys
-sys.path.insert(0, os.path.abspath(os.path.join(os.getcwd())))
-import pdb
+import copy
+import random
+from collections.abc import Mapping, Sequence
+from datetime import datetime
+from pathlib import Path
+from typing import Any, TypedDict
+
 import numpy as np
 import torch
-import torch.backends.cudnn
-import torch.cuda
-import torch.utils.data
-import torchquantum as tq
-import tqdm 
-import random
-
-from torchpack.utils import io
-# from torchpack import distributed as dist
+from qiskit_ibm_runtime.fake_provider import FakeYorktownV2
 from torchpack.environ import set_run_dir
 from torchpack.utils.config import configs
 from torchpack.utils.logging import logger
-from torchquantum.dataset import MNIST
-import torch.optim as optim
-from expressibility_both_case import compute_expressibility_without_noise
-from expressibility_both_case import compute_expressibility_noisy
-from torchquantum.plugin.qiskit.qiskit_processor import QiskitProcessor
 
-# from torchquantum.super_utils import get_named_sample_arch
-from qiskit_aer.primitives import SamplerV2 as Sampler
-print(f"Using torchquantum from: {os.path.dirname(tq.__file__)}")
-
-from qiskit_ibm_runtime.fake_provider import FakeYorktownV2
-
-
-# **Load configs**
-# 
-# The config file describes everything about the model structure.
-
-
-config_str = '''model:
-  arch:
-    n_wires: 4
-    encoder_op_list_name: 4x4_ryzxy
-    n_blocks: 3
-    n_layers_per_block: 2
-    q_layer_name: u3cu3_s0
-    down_sample_kernel_size: 6
-    n_front_share_blocks: 1
-    n_front_share_wires: 1
-    n_front_share_ops: 1
-  sampler:
-    strategy:
-      name: plain
-  transpile_before_run: False
-  load_op_list: False
-
-dataset:
-  name: mnist
-  input_name: image
-  target_name: digit
-
-optimizer:
-  name: adam
-  lr: 5e-2
-  weight_decay: 1e-4
-  lambda_lr: 1e-2
-
-run:
-  n_epochs: 40
-  bsz: 256
-  workers_per_gpu: 1
-  device: cpu
-
-debug:
-  pdb: False
-  set_seed: True
-  seed: 42
-
-callbacks:
-  - callback: 'InferenceRunner'
-    split: 'valid'
-    subcallbacks:
-      - metrics: 'CategoricalAccuracy'
-        name: 'acc/valid'
-      - metrics: 'NLLError'
-        name: 'loss/valid'
-  - callback: 'InferenceRunner'
-    split: 'test'
-    subcallbacks:
-      - metrics: 'CategoricalAccuracy'
-        name: 'acc/test'
-      - metrics: 'NLLError'
-        name: 'loss/test'
-  - callback: 'MaxSaver'
-    name: 'acc/valid'
-  - callback: 'Saver'
-    max_to_keep: 10
-
-qiskit:
-  use_qiskit: False
-  use_real_qc: False
-  backend_name: null
-  noise_model_name: null
-  basis_gates_name: null
-  n_shots: 8192
-  initial_layout: null
-  seed_transpiler: 42
-  seed_simulator: 42
-  optimization_level: 0
-  est_success_rate: False
-  max_jobs: 1
-
-
-es:
-  random_search: False
-  population_size: 100
-  parent_size: 20
-  mutation_size: 40
-  mutation_prob: 0.5
-  crossover_size: 40
-  n_iterations: 5
-  est_success_rate: False
-  score_mode: loss_succ
-  gene_mask: null
-  eval:
-    use_noise_model: True
-    use_real_qc: False
-    bsz: qiskit_max
-    n_test_samples: 150
-
-
-prune:
-  target_pruning_amount : 0.5
-  init_pruning_amount : 0.1
-  start_epoch : 0
-  end_epoch : 30
-
-'''
-f = open("configs_relation.yml", "w")
-f.write(config_str)
-f.close()
-
-configs.load('configs_relation.yml')
-if configs.debug.set_seed:
-    torch.manual_seed(configs.debug.seed)
-    np.random.seed(configs.debug.seed)
-
-    torch.cuda.manual_seed_all(configs.debug.seed)
-    # torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    # torch.use_deterministic_algorithms(True)
-
-
-from torchquantum.encoding import encoder_op_list_name_dict
-from torchquantum.algorithm.quantumnas.super_layers import super_layer_name_dict
-import torch.nn.functional as F
-from torchquantum.plugin import (
-    tq2qiskit_measurement,
-    qiskit_assemble_circs,
-    op_history2qiskit,
-    op_history2qiskit_expand_params,
+from expr_search_mnist import (
+    SuperQFCModel,
+    build_dataflow,
+    build_model_for_gene,
+    configure_runtime,
+    evaluate_gene_model,
 )
+from quantum_expressibility import (
+    estimate_ideal_expressibility,
+    estimate_noisy_expressibility,
+)
+from quantumnas_style_search import load_supercircuit_checkpoint
+from spearman_utils import export_all_loss_expressibility_csvs
 
 
-class SuperQFCModel0(tq.QuantumModule):
-    def __init__(self, arch):
-        super().__init__()
-        self.arch = arch
-        self.n_wires = arch['n_wires']
-        # self.q_device = tq.QuantumDevice(n_wires=self.n_wires)
-        self.encoder = tq.GeneralEncoder(
-            encoder_op_list_name_dict[arch['encoder_op_list_name']]
+Gene = list[int]
+
+DEFAULT_CONFIG = "configs_mnist.yaml"
+DEFAULT_CHECKPOINT = "max-acc-valid.pt"
+DEFAULT_OUTPUT_DIR = "files"
+DEFAULT_POPULATION_SIZE = 100
+DEFAULT_N_PAIRS = 200
+DEFAULT_N_BINS = 75
+SMOKE_TEST_SHOTS = 32
+
+
+class ExperimentResult(TypedDict):
+    """Metrics collected for one sampled quantum architecture."""
+
+    gene: Gene
+    accuracy: float
+    loss: float
+    ideal_kl: float
+    hilbert_schmidt_kl: float
+    uhlmann_kl: float
+
+
+def parse_args() -> argparse.Namespace:
+    """Parse experiment arguments."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", default=DEFAULT_CONFIG)
+    parser.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT)
+    parser.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument(
+        "--population-size",
+        type=int,
+        default=DEFAULT_POPULATION_SIZE,
+    )
+    parser.add_argument(
+        "--split",
+        choices=("valid", "test"),
+        default="valid",
+        help="Dataset split used to measure classification loss.",
+    )
+    parser.add_argument(
+        "--max-samples",
+        type=int,
+        default=None,
+        help="Optional maximum classification samples per architecture.",
+    )
+    parser.add_argument("--expressibility-pairs", type=int, default=DEFAULT_N_PAIRS)
+    parser.add_argument("--expressibility-bins", type=int, default=DEFAULT_N_BINS)
+    parser.add_argument(
+        "--ideal-classification",
+        action="store_true",
+        help="Evaluate classification without backend noise.",
+    )
+    parser.add_argument(
+        "--smoke-test",
+        action="store_true",
+        help="Run a tiny synthetic-data integration check.",
+    )
+    return parser.parse_args()
+
+
+def sample_unique_population(
+    gene_choices: Sequence[Sequence[int]],
+    population_size: int,
+    seed: int,
+) -> list[Gene]:
+    """Sample a reproducible population without duplicate architectures."""
+    if population_size < 1:
+        raise ValueError("population_size must be at least 1")
+    if not gene_choices or any(not choices for choices in gene_choices):
+        raise ValueError("Every gene position must have at least one choice")
+
+    search_space_size = int(np.prod([len(choices) for choices in gene_choices]))
+    if population_size > search_space_size:
+        raise ValueError(
+            f"population_size={population_size} exceeds the search space size "
+            f"of {search_space_size}"
         )
-        self.q_layer = super_layer_name_dict[arch['q_layer_name']](arch)
-        self.measure = tq.MeasureAll(tq.PauliZ)
-        self.sample_arch = None
 
-    def set_sample_arch(self, sample_arch):
-        self.sample_arch = sample_arch
-        self.q_layer.set_sample_arch(sample_arch)
-
-    def count_sample_params(self):
-        return self.q_layer.count_sample_params()
-
-    def forward(self, x, verbose=False, use_qiskit=False):
-        bsz = x.shape[0]
-        qdev = tq.QuantumDevice(n_wires=self.n_wires, bsz=bsz, record_op=True, device=x.device)
-        # self.q_device.reset_states(bsz=bsz)
-
-        if getattr(self.arch, 'down_sample_kernel_size', None) is not None:
-            x = F.avg_pool2d(x, self.arch['down_sample_kernel_size'])
-
-        x = x.view(bsz, -1)
-
-        if use_qiskit:
-            # use qiskit to process the circuit
-            # create the qiskit circuit for encoder
-            self.encoder(qdev, x)
-            op_history_parameterized = qdev.op_history
-            qdev.reset_op_history()
-            encoder_circs = op_history2qiskit_expand_params(self.n_wires, op_history_parameterized, bsz=bsz)
-
-            # create the qiskit circuit for trainable quantum layers
-            self.q_layer(qdev)
-            op_history_fixed = qdev.op_history
-            qdev.reset_op_history()
-            q_layer_circ = op_history2qiskit(self.n_wires, op_history_fixed)
-
-            # create the qiskit circuit for measurement
-            measurement_circ = tq2qiskit_measurement(qdev, self.measure)
-
-            # assemble the encoder, trainable quantum layers, and measurement circuits
-            assembled_circs = qiskit_assemble_circs(
-                encoder_circs, q_layer_circ, measurement_circ
-            )
-
-            # call the qiskit processor to process the circuit
-            x0 = self.qiskit_processor.process_ready_circs(qdev, assembled_circs, parallel=False).to(  # type: ignore
-                x.device
-            )
-            x = x0
-
-        else:
-            self.encoder(qdev, x)
-            self.q_layer(qdev)
-            x = self.measure(qdev)
-
-        if verbose:
-            logger.info(f"[use_qiskit]={use_qiskit}, expectation:\n {x.data}")
-
-        if getattr(self.arch, 'output_len', None) is not None:
-            x = x.reshape(bsz, -1, self.arch.output_len).sum(-1)
-
-        if x.dim() > 2:
-            x = x.squeeze()
-
-        x = F.log_softmax(x, dim=1)
-        return x
-
-    @property
-    def arch_space(self):
-        space = []
-        for layer in self.q_layer.super_layers_all:
-            space.append(layer.arch_space)
-        # for the number of sampled blocks
-        space.append(list(range(self.q_layer.n_front_share_blocks,
-                                self.q_layer.n_blocks + 1)))
-        return space
-
-
-# Load the model.
-
-
-import torch.nn.functional as F
-import torchquantum.device
-import torchquantum.algorithm.quantumnas.super_layers
-import torchquantum.operator
-import torchquantum.measurement
-print(f"Using torchquantum from: {os.path.dirname(tq.__file__)}")
-device = torch.device('cuda')
-if isinstance(configs.optimizer.lr, str):
-    configs.optimizer.lr = eval(configs.optimizer.lr)
-dataset = MNIST(
-    root='./mnist_data',
-    train_valid_split_ratio=[0.9, 0.1],
-    digits_of_interest=[0, 1, 2, 3],
-    n_test_samples=300,
-    n_train_samples=5000,
-    n_valid_samples=3000,
-)
-
-dataflow = dict()
-for split in dataset:
-    sampler = torch.utils.data.RandomSampler(dataset[split])
-    dataflow[split] = torch.utils.data.DataLoader(
-        dataset[split],
-        batch_size=configs.run.bsz,
-        sampler=sampler,
-        num_workers=0, #configs.run.workers_per_gpu,
-        pin_memory=True)
-model = SuperQFCModel0(configs.model.arch)
-# fix import paths 
-sys.modules['torchquantum.devices'] = torchquantum.device
-sys.modules['torchquantum.super_layers'] = torchquantum.algorithm.quantumnas.super_layers
-sys.modules['torchquantum.operators'] = torchquantum.operator
-sys.modules['torchquantum.measure'] = torchquantum.measurement
-state_dict = io.load('max-acc-valid.pt', map_location='cpu', weights_only=False)
-model.load_state_dict(state_dict['model'], strict=False)
-model.to(device)
-
-# -----------------------------------------------------
-# (A) Connect to IBM Quantum
-# -----------------------------------------------------
-# service = QiskitRuntimeService()
-# backend = service.backend("ibm_fez")
-
-# or fake backend
-from qiskit_aer.noise import NoiseModel
-from qiskit_ibm_runtime.fake_provider import FakeYorktownV2
-# Load fake backend
-fake_backend = FakeYorktownV2()
-noise_model = NoiseModel.from_backend(fake_backend)
-
-processor_real_qc = QiskitProcessor(
-    use_real_qc=False,                  # simulate, not run on real QC
-    noise_model=noise_model,    # IBM backend to pull noise from
-    ibm_quantum_token="---", # your IBM Quantum API token
-)
-
-model.set_qiskit_processor(processor_real_qc)
-
-
-
-def log_acc(output_all, target_all, k=1):
-    _, indices = output_all.topk(k, dim=1)
-    masks = indices.eq(target_all.view(-1, 1).expand_as(indices))
-    size = target_all.shape[0]
-    corrects = masks.sum().item()
-    accuracy = corrects / size
-    loss = F.nll_loss(output_all, target_all).item()
-    logger.info(f"Accuracy: {accuracy}")
-    logger.info(f"Loss: {loss}")
-    return accuracy, loss
-
-
-
-def evaluate_gene(gene=None, use_qiskit=True):
-    if gene is not None:
-        model.set_sample_arch(gene)
-    with torch.no_grad():
-        target_all = None
-        output_all = None
-        for feed_dict in tqdm.tqdm(dataflow['test']):
-            if configs.run.device == 'gpu':
-                # pdb.set_trace()
-                inputs = feed_dict[configs.dataset.input_name].cuda(non_blocking=True)
-                targets = feed_dict[configs.dataset.target_name].cuda(non_blocking=True)
-            else:
-                inputs = feed_dict[configs.dataset.input_name]
-                targets = feed_dict[configs.dataset.target_name]
-            outputs = model(inputs, use_qiskit=use_qiskit)
-            if target_all is None:
-                target_all = targets
-                output_all = outputs
-            else:
-                target_all = torch.cat([target_all, targets], dim=0)
-                output_all = torch.cat([output_all, outputs], dim=0)
-        accuracy, loss = log_acc(output_all, target_all)
-    return accuracy, loss
-
+    rng = random.Random(seed)
+    population: list[Gene] = []
+    observed_genes: set[tuple[int, ...]] = set()
+    while len(population) < population_size:
+        gene = [rng.choice(choices) for choices in gene_choices]
+        key = tuple(gene)
+        if key not in observed_genes:
+            observed_genes.add(key)
+            population.append(gene)
+    return population
 
 
 def evaluate_population(
-    population_size=100,
-    use_qiskit=True,
-    seed=42,
-):
-    random.seed(seed)
-    np.random.seed(seed)
-
-    gene_choice = model.arch_space
-    gene_len = len(gene_choice)
-
-    # -------------------------------
-    # 1. Sample population
-    # -------------------------------
-    population = []
-    for _ in range(population_size):
-        gene = [random.choice(gene_choice[i]) for i in range(gene_len)]
-        population.append(gene)
-
-    # -------------------------------
-    # 2. Evaluate population
-    # -------------------------------
+    cfg: Any,
+    model: SuperQFCModel,
+    population: Sequence[Gene],
+    dataflow: dict[str, Any],
+    backend: Any,
+    device: torch.device,
+    *,
+    split: str = "valid",
+    use_qiskit: bool = True,
+    max_samples: int | None = None,
+    n_pairs: int = DEFAULT_N_PAIRS,
+    n_bins: int = DEFAULT_N_BINS,
+    seed: int = 42,
+) -> list[ExperimentResult]:
+    """Collect classification and expressibility metrics for each gene."""
     results = []
-    for gene in tqdm.tqdm(population, desc="Evaluating genes"):
-        acc, loss = evaluate_gene(
-            gene=gene,
-            use_qiskit=use_qiskit
+    for gene in population:
+        accuracy, loss = evaluate_gene_model(
+            cfg,
+            model,
+            gene,
+            dataflow,
+            split=split,
+            device=device,
+            use_qiskit=use_qiskit,
+            max_samples=max_samples,
         )
-
-        KL_HS, KL_Uhlmann = compute_expressibility_noisy(
-        sample_arch=gene,
-        n_qubits=model.n_wires,
-        fake_backend=fake_backend)
-
-        KL_no_noise = compute_expressibility_without_noise(gene, n_qubits=model.n_wires)
-
-        results.append({
-            "gene": gene,
-            "accuracy": acc,
-            "loss": loss,
-            "KL_no_noise": KL_no_noise,
-            "KL_HS": KL_HS,
-            "KL_Uhlmann": KL_Uhlmann
-        })
-
+        ideal_kl = estimate_ideal_expressibility(
+            gene,
+            n_qubits=model.n_wires,
+            n_pairs=n_pairs,
+            n_bins=n_bins,
+            seed=seed,
+        )
+        hilbert_schmidt_kl, uhlmann_kl = estimate_noisy_expressibility(
+            architecture=gene,
+            n_qubits=model.n_wires,
+            backend=backend,
+            n_pairs=n_pairs,
+            n_bins=n_bins,
+            seed=seed,
+        )
+        results.append(
+            {
+                "gene": gene.copy(),
+                "accuracy": accuracy,
+                "loss": loss,
+                "ideal_kl": ideal_kl,
+                "hilbert_schmidt_kl": hilbert_schmidt_kl,
+                "uhlmann_kl": uhlmann_kl,
+            }
+        )
     return results
 
 
+def log_summaries(summaries: Mapping[str, Mapping[str, object]]) -> None:
+    """Log correlation summaries in a compact, readable format."""
+    for metric_name, summary in summaries.items():
+        logger.info(
+            f"{metric_name}: Spearman correlation="
+            f"{float(summary['correlation']):.6f}, "
+            f"p-value={float(summary['p_value']):.3e}, "
+            f"n={int(summary['n_samples'])}, "
+            f"CSV={summary['csv_path']}"
+        )
 
 
-results = evaluate_population(population_size=100, use_qiskit=True)
+def _synthetic_dataflow(cfg: Any, device: torch.device) -> dict[str, Any]:
+    """Create small in-memory batches for the smoke test."""
+    inputs = torch.randn(3, 1, 28, 28, device=device)
+    targets = torch.tensor([0, 1, 2], device=device)
+    batch = {
+        cfg.dataset.input_name: inputs,
+        cfg.dataset.target_name: targets,
+    }
+    return {"train": [batch], "valid": [batch], "test": [batch]}
 
 
-from spearman_utils import export_all_loss_kl
+def run_smoke_test(
+    cfg: Any,
+    device: torch.device,
+    checkpoint_path: Path,
+) -> None:
+    """Exercise checkpoint, classification, expressibility, and CSV exports."""
+    backend = FakeYorktownV2()
+    architecture_probe = SuperQFCModel(copy.deepcopy(cfg.model.arch))
+    gene_choices = architecture_probe.arch_space
+    population = sample_unique_population(
+        gene_choices,
+        population_size=3,
+        seed=int(cfg.debug.seed),
+    )
+    model = build_model_for_gene(
+        cfg,
+        population[0],
+        device,
+        noisy_backend=backend,
+        n_shots=SMOKE_TEST_SHOTS,
+    )
+    load_supercircuit_checkpoint(model, checkpoint_path)
+    results = evaluate_population(
+        cfg,
+        model,
+        population,
+        _synthetic_dataflow(cfg, device),
+        backend,
+        device,
+        split="valid",
+        use_qiskit=True,
+        max_samples=3,
+        n_pairs=2,
+        n_bins=8,
+        seed=int(cfg.debug.seed),
+    )
+
+    # Three quantum results can legitimately tie on a tiny, shot-based sample.
+    # Use deterministic non-constant values to test the statistical exporter.
+    export_probe = [dict(result) for result in results]
+    for index, result in enumerate(export_probe):
+        result["loss"] = float(index + 1)
+        result["ideal_kl"] = float(3 - index)
+        result["hilbert_schmidt_kl"] = float(index + 2)
+        result["uhlmann_kl"] = float(2 * index + 1)
+
+    smoke_output_dir = Path(".codex_review") / "loss_expressibility"
+    try:
+        summaries = export_all_loss_expressibility_csvs(
+            export_probe,
+            smoke_output_dir,
+        )
+        if len(summaries) != 3:
+            raise RuntimeError("Smoke test did not export all metric summaries")
+    finally:
+        for filename in (
+            "loss_kl_ideal.csv",
+            "loss_kl_hilbert_schmidt.csv",
+            "loss_kl_uhlmann.csv",
+        ):
+            (smoke_output_dir / filename).unlink(missing_ok=True)
+        if smoke_output_dir.exists():
+            smoke_output_dir.rmdir()
+
+    if len(results) != 3 or not all(
+        np.isfinite(result["loss"]) for result in results
+    ):
+        raise RuntimeError("Smoke test produced invalid quantum results")
+    logger.info("Loss-expressibility smoke test passed.")
 
 
-# ======================================================
-# Export CSVs for TikZ figures
-# ======================================================
+def run_experiment(
+    cfg: Any,
+    device: torch.device,
+    args: argparse.Namespace,
+) -> None:
+    """Run the full loss-expressibility analysis and export its results."""
+    run_name = f"loss_expr_relation_{datetime.now():%Y%m%d_%H%M%S}"
+    set_run_dir(str(Path("runs") / run_name))
+    backend = FakeYorktownV2()
+    dataflow = build_dataflow(cfg, device)
+    architecture_probe = SuperQFCModel(copy.deepcopy(cfg.model.arch))
+    population = sample_unique_population(
+        architecture_probe.arch_space,
+        args.population_size,
+        seed=int(cfg.debug.seed),
+    )
+    model = build_model_for_gene(
+        cfg,
+        population[0],
+        device,
+        noisy_backend=None if args.ideal_classification else backend,
+    )
+    load_supercircuit_checkpoint(model, Path(args.checkpoint).resolve())
 
-export_all_loss_kl(results, save_dir="files")
-
-print("\n[INFO] CSV export finished. Ready for TikZ.")
-
-
-# \begin{tikzpicture}
-# \begin{axis}[
-#     width=0.8\columnwidth,
-#     grid=major,
-#     grid style={dashed,gray!40},
-#     xlabel=\textbf{Loss},
-#     ylabel=\textbf{KL (HS)},
-#     label style={font=\small},
-#     tick label style={font=\small},
-# ]
-# \addplot[
-#     blue,
-#     only marks,
-#     mark size=1.5pt
-# ]
-# table[x=loss,y=kl,col sep=comma] {files/loss_kl_hs.csv};
-# \end{axis}
-# \end{tikzpicture}
+    results = evaluate_population(
+        cfg,
+        model,
+        population,
+        dataflow,
+        backend,
+        device,
+        split=args.split,
+        use_qiskit=not args.ideal_classification,
+        max_samples=args.max_samples,
+        n_pairs=args.expressibility_pairs,
+        n_bins=args.expressibility_bins,
+        seed=int(cfg.debug.seed),
+    )
+    summaries = export_all_loss_expressibility_csvs(
+        results,
+        args.output_dir,
+    )
+    log_summaries(summaries)
 
 
+def main() -> None:
+    """Load configuration and run the smoke test or full analysis."""
+    args = parse_args()
+    if args.population_size < 1:
+        raise ValueError("--population-size must be at least 1")
+    if args.expressibility_pairs < 1:
+        raise ValueError("--expressibility-pairs must be at least 1")
+    if args.expressibility_bins < 2:
+        raise ValueError("--expressibility-bins must be at least 2")
+    if args.max_samples is not None and args.max_samples < 1:
+        raise ValueError("--max-samples must be at least 1")
 
+    configs.load(args.config)
+    if isinstance(configs.optimizer.lr, str):
+        configs.optimizer.lr = float(configs.optimizer.lr)
+    device = configure_runtime(configs)
+    checkpoint_path = Path(args.checkpoint).resolve()
+
+    if args.smoke_test:
+        run_smoke_test(configs, device, checkpoint_path)
+    else:
+        run_experiment(configs, device, args)
+
+
+if __name__ == "__main__":
+    main()

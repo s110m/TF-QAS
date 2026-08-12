@@ -1,544 +1,517 @@
+"""QuantumNAS-style architecture search for a four-class MNIST QNN.
+
+The search follows a weight-sharing workflow:
+
+1. Load a pretrained supercircuit checkpoint.
+2. Search candidate subcircuits on a small noisy validation subset.
+3. Retrain each selected subcircuit on an ideal simulator.
+4. Select weights on clean validation accuracy.
+5. Report noisy test accuracy once for each target backend.
+
+Run the lightweight integration check before starting the full experiment::
+
+    python quantumnas_style_search.py --smoke-test
+"""
+
+from __future__ import annotations
 
 import argparse
-import os
+import copy
+import random
 import sys
+from collections.abc import Mapping, Sequence
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
 import numpy as np
 import torch
-import torch.backends.cudnn
-import torch.cuda
-import torch.nn
-import torch.utils.data
-import torchquantum as tq
-import tqdm
-import random
-
-from torchpack.utils import io
-
+import torch.nn.functional as F
+import torchquantum.algorithm.quantumnas.super_layers
+import torchquantum.device
+import torchquantum.measurement
+import torchquantum.operator
+from qiskit_ibm_runtime.fake_provider import (
+    FakeManilaV2,
+    FakeTorino,
+    FakeYorktownV2,
+)
 from torchpack.environ import set_run_dir
+from torchpack.utils import io
 from torchpack.utils.config import configs
 from torchpack.utils.logging import logger
-from torchquantum.dataset import MNIST
-import torch.optim as optim
-import copy
 
-import torch.nn.functional as F
-import torchquantum.device
-import torchquantum.algorithm.quantumnas.super_layers
-import torchquantum.operator
-import torchquantum.measurement
-from torchquantum.plugin.qiskit.qiskit_processor import QiskitProcessor
-
-from qiskit_aer.noise import NoiseModel
-print(f"Using torchquantum from: {os.path.dirname(tq.__file__)}")
-
-
-sys.modules['torchquantum.devices'] = torchquantum.device
-sys.modules['torchquantum.super_layers'] = torchquantum.algorithm.quantumnas.super_layers
-sys.modules['torchquantum.operators'] = torchquantum.operator
-sys.modules['torchquantum.measure'] = torchquantum.measurement
-
-
-# **Load configs**
-# The config file describes everything about the model structure.
-
-parser = argparse.ArgumentParser()
-parser.add_argument("--config", default="configs_mnist.yaml")
-args = parser.parse_args()
-
-configs.load(args.config)
-
-if configs.debug.set_seed:
-    torch.manual_seed(configs.debug.seed)
-    np.random.seed(configs.debug.seed)
-    torch.cuda.manual_seed_all(configs.debug.seed)
-    torch.backends.cudnn.benchmark = False
-
-from torchquantum.encoding import encoder_op_list_name_dict
-from torchquantum.algorithm.quantumnas.super_layers import super_layer_name_dict
-import torch.nn.functional as F
-from torchquantum.plugin import (
-    tq2qiskit_measurement,
-    qiskit_assemble_circs,
-    op_history2qiskit,
-    op_history2qiskit_expand_params,
+from expr_search_mnist import (
+    SuperQFCModel,
+    build_dataflow,
+    build_model_for_gene,
+    configure_runtime,
+    evaluate_gene_model,
+    portable_state_dict,
+    train_gene,
 )
 
 
-class SuperQFCModel0(tq.QuantumModule):
-    def __init__(self, arch):
-        super().__init__()
-        self.arch = arch
-        self.n_wires = arch['n_wires']
-        # self.q_device = tq.QuantumDevice(n_wires=self.n_wires)
-        self.encoder = tq.GeneralEncoder(
-            encoder_op_list_name_dict[arch['encoder_op_list_name']]
-        )
-        self.q_layer = super_layer_name_dict[arch['q_layer_name']](arch)
-        self.measure = tq.MeasureAll(tq.PauliZ)
-        self.sample_arch = None
+Gene = list[int]
+StateDict = dict[str, torch.Tensor]
 
-    def set_sample_arch(self, sample_arch):
-        self.sample_arch = sample_arch
-        self.q_layer.set_sample_arch(sample_arch)
-
-    def count_sample_params(self):
-        return self.q_layer.count_sample_params()
-
-    def forward(self, x, verbose=False, use_qiskit=False):
-        bsz = x.shape[0]
-        qdev = tq.QuantumDevice(n_wires=self.n_wires, bsz=bsz, record_op=True, device=x.device)
-        # self.q_device.reset_states(bsz=bsz)
-
-        if getattr(self.arch, 'down_sample_kernel_size', None) is not None:
-            x = F.avg_pool2d(x, self.arch['down_sample_kernel_size'])
-
-        x = x.view(bsz, -1)
-
-        if use_qiskit:
-            # use qiskit to process the circuit
-            # create the qiskit circuit for encoder
-            self.encoder(qdev, x)
-            op_history_parameterized = qdev.op_history
-            qdev.reset_op_history()
-            encoder_circs = op_history2qiskit_expand_params(self.n_wires, op_history_parameterized, bsz=bsz)
-
-            # create the qiskit circuit for trainable quantum layers
-            self.q_layer(qdev)
-            op_history_fixed = qdev.op_history
-            qdev.reset_op_history()
-            q_layer_circ = op_history2qiskit(self.n_wires, op_history_fixed)
-
-            # create the qiskit circuit for measurement
-            measurement_circ = tq2qiskit_measurement(qdev, self.measure)
-
-            # assemble the encoder, trainable quantum layers, and measurement circuits
-            assembled_circs = qiskit_assemble_circs(
-                encoder_circs, q_layer_circ, measurement_circ
-            )
-
-            # call the qiskit processor to process the circuit
-            x0 = self.qiskit_processor.process_ready_circs(qdev, assembled_circs, parallel=True).to(  # type: ignore
-                x.device
-            )
-            x = x0
-
-            # x = self.qiskit_processor.process_parameterized(
-                # self.q_device, self.encoder, self.q_layer, self.measure, x)
-        else:
-            self.encoder(qdev, x)
-            self.q_layer(qdev)
-            x = self.measure(qdev)
-
-        if verbose:
-            logger.info(f"[use_qiskit]={use_qiskit}, expectation:\n {x.data}")
-
-        if getattr(self.arch, 'output_len', None) is not None:
-            x = x.reshape(bsz, -1, self.arch.output_len).sum(-1)
-
-        if x.dim() > 2:
-            x = x.squeeze()
-
-        x = F.log_softmax(x, dim=1)
-        return x
-
-    @property
-    def arch_space(self):
-        space = []
-        for layer in self.q_layer.super_layers_all:
-            space.append(layer.arch_space)
-        # for the number of sampled blocks
-        space.append(list(range(self.q_layer.n_front_share_blocks,
-                                self.q_layer.n_blocks + 1)))
-        return space
+DEFAULT_CHECKPOINT = "max-acc-valid.pt"
+DEFAULT_N_EXPERIMENTS = 5
+SMOKE_TEST_SHOTS = 32
 
 
-print(f"Using torchquantum from: {os.path.dirname(tq.__file__)}")
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-if isinstance(configs.optimizer.lr, str):
-    configs.optimizer.lr = eval(configs.optimizer.lr)
-dataset = MNIST(
-    root='./mnist_data',
-    train_valid_split_ratio=[0.9, 0.1],
-    digits_of_interest=[0, 1, 2, 3],
-    n_test_samples=300,
-    n_train_samples=5000,
-    n_valid_samples=3000,
-)
-dataflow = dict()
-for split in dataset:
-    sampler = torch.utils.data.RandomSampler(dataset[split])
-    dataflow[split] = torch.utils.data.DataLoader(
-        dataset[split],
-        batch_size=configs.run.bsz,
-        sampler=sampler,
-        num_workers=configs.run.workers_per_gpu,
-        pin_memory=True)
-
-
-
-def log_acc(output_all, target_all, k=1):
-    _, indices = output_all.topk(k, dim=1)
-    masks = indices.eq(target_all.view(-1, 1).expand_as(indices))
-    size = target_all.shape[0]
-    corrects = masks.sum().item()
-    accuracy = corrects / size
-    loss = F.nll_loss(output_all, target_all).item()
-    logger.info(f"Accuracy: {accuracy}")
-    logger.info(f"Loss: {loss}")
-    return accuracy
-
-def evaluate_gene(model, gene=None, use_qiskit=False):
-    if gene is not None:
-        model.set_sample_arch(gene)
-    with torch.no_grad():
-        target_all = None
-        output_all = None
-        for feed_dict in tqdm.tqdm(dataflow['test']):
-            if configs.run.device == 'gpu':
-                # pdb.set_trace()
-                inputs = feed_dict[configs.dataset.input_name].cuda(non_blocking=True)
-                targets = feed_dict[configs.dataset.target_name].cuda(non_blocking=True)
-            else:
-                inputs = feed_dict[configs.dataset.input_name]
-                targets = feed_dict[configs.dataset.target_name]
-            outputs = model(inputs, use_qiskit=use_qiskit)
-            if target_all is None:
-                target_all = targets
-                output_all = outputs
-            else:
-                target_all = torch.cat([target_all, targets], dim=0)
-                output_all = torch.cat([output_all, outputs], dim=0)
-        accuracy = log_acc(output_all, target_all)
-    return accuracy
-
-
-
-def evaluate_gene_model(model, gene=None, use_qiskit=False):
-    if gene is not None:
-        model.set_sample_arch(gene)
-    with torch.no_grad():
-        target_all = []
-        output_all = []
-        for feed_dict in tqdm.tqdm(dataflow['test']):
-            if configs.run.device == 'gpu':
-                inputs = feed_dict[configs.dataset.input_name].cuda(non_blocking=True)
-                targets = feed_dict[configs.dataset.target_name].cuda(non_blocking=True)
-            else:
-                inputs = feed_dict[configs.dataset.input_name]
-                targets = feed_dict[configs.dataset.target_name]
-
-            outputs = model(inputs, use_qiskit=use_qiskit)
-            target_all.append(targets)
-            output_all.append(outputs)
-
-        target_all = torch.cat(target_all, dim=0)
-        output_all = torch.cat(output_all, dim=0)
-    accuracy = log_acc(output_all, target_all)
-
-    return accuracy
-
-
-# # ####Part 1.2 Evolutionary Search
-
-
-class EvolutionarySearcher:
-    def __init__(self,
-                 gene_choice,
-                 accuracy_predictor,
-                 configs):
-        self.gene_choice = gene_choice
-        self.gene_len = len(self.gene_choice)
-        self.accuracy_predictor = accuracy_predictor
-        self.n_iterations = configs.es.n_iterations
-        self.parent_size = configs.es.parent_size
-        self.mutation_size = configs.es.mutation_size
-        self.mutation_prob = configs.es.mutation_prob
-        self.crossover_size = configs.es.crossover_size
-
-    def random_sample(self, sample_num):
-        # randomly sample genes
-        population = []
-        i = 0
-        while i < sample_num:
-            samp_gene = []
-            for k in range(self.gene_len):
-                samp_gene.append(random.choices(self.gene_choice[k])[0])
-            population.append(samp_gene)
-            i += 1
-        return population
-
-    def ask(self):
-        """return the solutions"""
-        return self.population
-
-    def select_and_transform(self, scores):
-        """perform evo search according to the scores"""
-        
-        # sort the index according to the scores (descending order)
-        sorted_idx = (-np.array(scores)).argsort()[:self.parent_size]
-
-        # hint: update self.best_solution and self.best_score
-        self.best_solution = self.population[sorted_idx[0]]
-        self.best_score = scores[sorted_idx[0]]
-
-        parents = [self.population[i] for i in sorted_idx]
-
-        # mutation
-        mutate_population = []
-        k = 0
-        while k < self.mutation_size:
-            mutated_gene = self.mutate(random.choices(parents)[0])
-            mutate_population.append(mutated_gene)
-            k += 1
-
-        # crossover
-        crossover_population = []
-        k = 0
-        while k < self.crossover_size:
-            crossovered_gene = self.crossover(random.sample(parents, 2))
-            crossover_population.append(crossovered_gene)
-            k += 1
-
-        self.population = parents + mutate_population + crossover_population
-
-    def crossover(self, genes):
-        crossovered_gene = []
-        for i in range(self.gene_len):
-            if np.random.uniform() < 0.5:
-                crossovered_gene.append(genes[0][i])
-            else:
-                crossovered_gene.append(genes[1][i])
-        return crossovered_gene
-
-    def mutate(self, gene):
-        mutated_gene = []
-        for i in range(self.gene_len):        
-            # use np.random.uniform() to decide whether to mutate position i
-            # mutate ith position of gene with self.mutation_prob as mutation probability
-            if np.random.uniform() < self.mutation_prob:
-                mutated_gene.append(random.choices(self.gene_choice[i])[0])
-            else:
-                mutated_gene.append(gene[i])
-        return mutated_gene
-    
-    def run_search(self, noisy_backends, n_experiments):
-        best_genes_all_backends = []
-
-        random.seed(configs.debug.seed)
-        np.random.seed(configs.debug.seed)
-        torch.manual_seed(configs.debug.seed)
-        torch.cuda.manual_seed_all(configs.debug.seed)
-
-        for backend in noisy_backends:
-            best_genes = []
-
-            # Fresh model per backend (good)
-            model = SuperQFCModel0(configs.model.arch)
-            state_dict = io.load('max-acc-valid.pt', map_location='cpu', weights_only=False)
-            model.load_state_dict(state_dict['model'], strict=False)
-            model.to(device)
-
-            noise_model = NoiseModel.from_backend(backend)
-
-            processor_real_qc = QiskitProcessor(
-            use_real_qc=False,                  # simulate, not run on real QC
-            noise_model=noise_model,    # IBM backend to pull noise from
-            ibm_quantum_token="---", # your IBM Quantum API token
-        )
-            model.set_qiskit_processor(processor_real_qc)
-
-            for i in range(n_experiments):
-
-                # sample subcircuits
-                self.population = self.random_sample(
-                    self.parent_size + self.mutation_size + self.crossover_size
-                )
-
-                for j in range(self.n_iterations):
-                    accs = []
-                    for gene in self.population:
-                        accs.append(self.accuracy_predictor(model,
-                            gene=gene,
-                            use_qiskit=True
-                        ))
-                    self.select_and_transform(accs)
-
-                logger.info(
-                    f"Best solution for backend {backend.name}: {self.best_solution}"
-                )
-                logger.info(
-                    f"Best score for backend {backend.name}: {self.best_score}"
-                )
-
-                best_genes.append(self.best_solution)
-
-            logger.info(
-                f"Best genes for backend {backend.name} are {best_genes}"
-            )
-            best_genes_all_backends.append(best_genes)
-
-        logger.info(
-            f"Best genes for all the backends are {best_genes_all_backends}"
-        )
-
-        return best_genes_all_backends
-
-
-
-
-def build_model_for_gene(
-    gene,
-    noisy_backend,
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-):
-    
-    model = SuperQFCModel0(
-        copy.deepcopy(configs.model.arch)
+def parse_args() -> argparse.Namespace:
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", default="configs_mnist.yaml")
+    parser.add_argument(
+        "--checkpoint",
+        default=DEFAULT_CHECKPOINT,
+        help="Trusted pretrained supercircuit checkpoint.",
     )
-
-    noise_model = NoiseModel.from_backend(noisy_backend)
-
-    processor_real_qc = QiskitProcessor(
-    use_real_qc=False,                  # simulate, not run on real QC
-    noise_model=noise_model,    # IBM backend to pull noise from
-    ibm_quantum_token="---", # your IBM Quantum API token
-)
-    model.set_qiskit_processor(processor_real_qc)
-
-
-    model.to(device)
-
-    model.set_sample_arch(gene)
-
-    return model
-
-
-
-def train_subcircuit_simple(
-    gene,
-    noisy_backend,
-    n_epochs=5,
-    lr=1e-3,
-    weight_decay=1e-4,
-    use_qiskit_eval=True,
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-    verbose=False,
-):
-    """
-    Train a fixed subcircuit (gene) and return the best accuracy during training.
-    """
-
-    model = build_model_for_gene(gene, noisy_backend, device=device)
-    model.train()
-
-    optimizer = torch.optim.Adam(
-        model.parameters(),
-        lr=lr,
-        weight_decay=weight_decay,
+    parser.add_argument(
+        "--experiments",
+        type=int,
+        default=DEFAULT_N_EXPERIMENTS,
+        help="Independent evolutionary searches per backend.",
     )
+    parser.add_argument(
+        "--smoke-test",
+        action="store_true",
+        help="Run a tiny synthetic-data search without loading MNIST.",
+    )
+    return parser.parse_args()
 
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=n_epochs)
 
-    criterion = torch.nn.NLLLoss()
+def _register_legacy_checkpoint_aliases() -> None:
+    """Register names required by checkpoints created by the original script."""
+    main_module = sys.modules["__main__"]
+    if not hasattr(main_module, "SuperQFCModel0"):
+        main_module.SuperQFCModel0 = SuperQFCModel
 
-    best_acc = -1.0
-    eval_interval = 5  # or even 10
+    legacy_modules = {
+        "torchquantum.devices": torchquantum.device,
+        "torchquantum.super_layers": (
+            torchquantum.algorithm.quantumnas.super_layers
+        ),
+        "torchquantum.operators": torchquantum.operator,
+        "torchquantum.measure": torchquantum.measurement,
+    }
+    for legacy_name, current_module in legacy_modules.items():
+        sys.modules.setdefault(legacy_name, current_module)
 
-    # -------------------------
-    # Training loop
-    # -------------------------
-    for epoch in range(n_epochs):
-        model.train()
-        epoch_loss = 0.0
-        # eval_interval = 5  # or even 10
 
-        for feed_dict in dataflow['train']:
-            inputs = feed_dict[configs.dataset.input_name].cuda(non_blocking=True)
-            targets = feed_dict[configs.dataset.target_name].cuda(non_blocking=True)
+def load_supercircuit_checkpoint(
+    model: SuperQFCModel,
+    checkpoint_path: Path,
+) -> None:
+    """Load a trusted legacy checkpoint into the current model definition."""
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(
+            f"Supercircuit checkpoint not found: {checkpoint_path}"
+        )
 
-            outputs = model(inputs)
-            loss = criterion(outputs, targets)
+    _register_legacy_checkpoint_aliases()
+    checkpoint = io.load(
+        str(checkpoint_path),
+        map_location="cpu",
+        weights_only=False,
+    )
+    if not isinstance(checkpoint, Mapping) or "model" not in checkpoint:
+        raise ValueError("Checkpoint must contain a 'model' state dictionary")
+    if not isinstance(checkpoint["model"], Mapping):
+        raise ValueError("Checkpoint 'model' entry must be a state dictionary")
 
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+    legacy_parameter_suffixes = (".U3_params", ".CU3_params")
+    model_state = {
+        name: value
+        for name, value in checkpoint["model"].items()
+        if "q_device." not in name
+        and not name.endswith(legacy_parameter_suffixes)
+    }
+    incompatible = model.load_state_dict(model_state, strict=False)
+    if incompatible.missing_keys:
+        raise RuntimeError(
+            "Checkpoint is missing model parameters: "
+            f"{incompatible.missing_keys}"
+        )
+    if incompatible.unexpected_keys:
+        raise RuntimeError(
+            "Checkpoint contains unsupported parameters: "
+            f"{incompatible.unexpected_keys}"
+        )
 
-            epoch_loss += loss.item()
 
-        epoch_loss /= len(dataflow['train'])
+class AccuracyEvolutionarySearcher:
+    """Elitist evolutionary search using noisy validation accuracy."""
 
-        # -------------------------
-        # Evaluation
-        # -------------------------
-        if epoch % eval_interval == 0 or epoch == n_epochs-1:
-            
-            acc = evaluate_gene_model(
+    def __init__(
+        self,
+        gene_choices: Sequence[Sequence[int]],
+        cfg: Any,
+        dataflow: dict[str, Any],
+        device: torch.device,
+        *,
+        n_iterations: int | None = None,
+        parent_size: int | None = None,
+        mutation_size: int | None = None,
+        crossover_size: int | None = None,
+        mutation_probability: float | None = None,
+        max_validation_samples: int | None = None,
+    ) -> None:
+        self.gene_choices = [list(choices) for choices in gene_choices]
+        self.cfg = cfg
+        self.dataflow = dataflow
+        self.device = device
+        self.n_iterations = int(
+            cfg.es.n_iterations if n_iterations is None else n_iterations
+        )
+        self.parent_size = int(
+            cfg.es.parent_size if parent_size is None else parent_size
+        )
+        self.mutation_size = int(
+            cfg.es.mutation_size if mutation_size is None else mutation_size
+        )
+        self.crossover_size = int(
+            cfg.es.crossover_size if crossover_size is None else crossover_size
+        )
+        self.mutation_probability = float(
+            mutation_probability
+            if mutation_probability is not None
+            else cfg.es.mutation_prob
+        )
+        self.max_validation_samples = int(
+            cfg.es.eval.n_test_samples
+            if max_validation_samples is None
+            else max_validation_samples
+        )
+        self.population: list[Gene] = []
+        self.score_cache: dict[tuple[int, ...], float] = {}
+
+        if not self.gene_choices or any(
+            not choices for choices in self.gene_choices
+        ):
+            raise ValueError("Every gene position must have at least one choice")
+        if self.n_iterations < 1:
+            raise ValueError("n_iterations must be at least 1")
+        if self.parent_size < 1:
+            raise ValueError("parent_size must be at least 1")
+        if self.mutation_size < 0 or self.crossover_size < 0:
+            raise ValueError("mutation_size and crossover_size cannot be negative")
+        if self.crossover_size and self.parent_size < 2:
+            raise ValueError("At least two parents are required for crossover")
+        if not 0.0 <= self.mutation_probability <= 1.0:
+            raise ValueError("mutation_probability must be between 0 and 1")
+        if self.max_validation_samples < 1:
+            raise ValueError("max_validation_samples must be at least 1")
+
+    def random_sample(self, sample_count: int) -> list[Gene]:
+        """Sample genes independently from the discrete search space."""
+        return [
+            [random.choice(choices) for choices in self.gene_choices]
+            for _ in range(sample_count)
+        ]
+
+    def mutate(self, gene: Sequence[int]) -> Gene:
+        """Mutate each gene position independently."""
+        return [
+            random.choice(self.gene_choices[index])
+            if random.random() < self.mutation_probability
+            else value
+            for index, value in enumerate(gene)
+        ]
+
+    def crossover(self, parents: Sequence[Sequence[int]]) -> Gene:
+        """Create a child by uniformly mixing two parents."""
+        return [
+            parents[0][index] if random.random() < 0.5 else parents[1][index]
+            for index in range(len(self.gene_choices))
+        ]
+
+    def score_gene(
+        self,
+        model: SuperQFCModel,
+        gene: Sequence[int],
+    ) -> float:
+        """Evaluate and cache noisy validation accuracy for one gene."""
+        key = tuple(gene)
+        if key not in self.score_cache:
+            accuracy, _ = evaluate_gene_model(
+                self.cfg,
                 model,
-                gene=gene,
-                use_qiskit=use_qiskit_eval,
+                gene,
+                self.dataflow,
+                split="valid",
+                device=self.device,
+                use_qiskit=True,
+                max_samples=self.max_validation_samples,
             )
-            if acc > best_acc:
-                best_acc = acc
-               
+            self.score_cache[key] = accuracy
+        return self.score_cache[key]
 
-        scheduler.step()
+    def select_and_transform(
+        self,
+        scores: Sequence[float],
+    ) -> tuple[Gene, float]:
+        """Keep elite parents, then generate mutations and crossovers."""
+        if len(scores) != len(self.population):
+            raise ValueError("Every population member must have one score")
+        if self.parent_size > len(self.population):
+            raise ValueError("parent_size cannot exceed population size")
 
-        if verbose:
-            print(
-                f"[Epoch {epoch:02d}] "
-                f"Loss={epoch_loss:.4f}, "
-                f"Acc={acc:.4f}, "
-                f"Best={best_acc:.4f}"
+        parent_indices = np.argsort(-np.asarray(scores))[: self.parent_size]
+        parents = [self.population[index] for index in parent_indices]
+        best_gene = parents[0].copy()
+        best_score = float(scores[parent_indices[0]])
+
+        mutations = [
+            self.mutate(random.choice(parents))
+            for _ in range(self.mutation_size)
+        ]
+        crossovers = [
+            self.crossover(random.sample(parents, 2))
+            for _ in range(self.crossover_size)
+        ]
+        self.population = parents + mutations + crossovers
+        return best_gene, best_score
+
+    def search(
+        self,
+        model: SuperQFCModel,
+        n_experiments: int,
+    ) -> list[Gene]:
+        """Run independent searches for a single noisy backend model."""
+        if n_experiments < 1:
+            raise ValueError("n_experiments must be at least 1")
+
+        population_size = (
+            self.parent_size + self.mutation_size + self.crossover_size
+        )
+        winners = []
+        for experiment_index in range(n_experiments):
+            self.population = self.random_sample(population_size)
+            best_gene: Gene | None = None
+            best_score = -1.0
+
+            for _ in range(self.n_iterations):
+                scores = [
+                    self.score_gene(model, gene) for gene in self.population
+                ]
+                generation_gene, generation_score = self.select_and_transform(
+                    scores
+                )
+                if generation_score > best_score:
+                    best_gene = generation_gene
+                    best_score = generation_score
+
+            if best_gene is None:
+                raise RuntimeError("Evolutionary search produced no solution")
+            winners.append(best_gene.copy())
+            logger.info(
+                f"Experiment {experiment_index + 1}: best gene={best_gene}, "
+                f"validation accuracy={best_score:.6f}"
             )
+        return winners
 
-    return best_acc
 
+def search_backends(
+    cfg: Any,
+    dataflow: dict[str, Any],
+    device: torch.device,
+    checkpoint_path: Path,
+    noisy_backends: Sequence[Any],
+    n_experiments: int,
+) -> list[list[Gene]]:
+    """Search the best genes independently for every noisy backend."""
+    architecture_probe = SuperQFCModel(copy.deepcopy(cfg.model.arch))
+    gene_choices = architecture_probe.arch_space
+    initial_gene = [choices[0] for choices in gene_choices]
+    winners_by_backend = []
+
+    for backend in noisy_backends:
+        model = build_model_for_gene(
+            cfg,
+            initial_gene,
+            device,
+            noisy_backend=backend,
+        )
+        load_supercircuit_checkpoint(model, checkpoint_path)
+        searcher = AccuracyEvolutionarySearcher(
+            gene_choices,
+            cfg,
+            dataflow,
+            device,
+        )
+        winners = searcher.search(model, n_experiments)
+        winners_by_backend.append(winners)
+        logger.info(f"{backend.name} selected genes: {winners}")
+
+    return winners_by_backend
+
+
+def train_and_evaluate_genes(
+    cfg: Any,
+    dataflow: dict[str, Any],
+    device: torch.device,
+    noisy_backends: Sequence[Any],
+    genes_by_backend: Sequence[Sequence[Gene]],
+) -> list[np.ndarray]:
+    """Retrain selected genes once and report noisy test accuracy."""
+    trained_states: dict[tuple[int, ...], StateDict] = {}
+    results = []
+
+    for backend, genes in zip(noisy_backends, genes_by_backend, strict=True):
+        backend_accuracies = []
+        for gene in genes:
+            key = tuple(gene)
+            if key not in trained_states:
+                trained_states[key] = train_gene(cfg, gene, dataflow, device)
+
+            model = build_model_for_gene(
+                cfg,
+                gene,
+                device,
+                noisy_backend=backend,
+            )
+            model.load_state_dict(trained_states[key])
+            accuracy, _ = evaluate_gene_model(
+                cfg,
+                model,
+                gene,
+                dataflow,
+                split="test",
+                device=device,
+                use_qiskit=True,
+            )
+            backend_accuracies.append(accuracy)
+
+        accuracy_array = np.asarray(backend_accuracies)
+        results.append(accuracy_array)
+        logger.info(
+            f"{backend.name} test accuracies: {accuracy_array} "
+            f"(mean {accuracy_array.mean():.6f})"
+        )
+    return results
+
+
+def _synthetic_dataflow(cfg: Any, device: torch.device) -> dict[str, Any]:
+    """Create tiny in-memory batches for the integration test."""
+    inputs = torch.randn(2, 1, 28, 28, device=device)
+    targets = torch.tensor([0, 1], device=device)
+    batch = {
+        cfg.dataset.input_name: inputs,
+        cfg.dataset.target_name: targets,
+    }
+    return {"train": [batch], "valid": [batch], "test": [batch]}
+
+
+def run_smoke_test(
+    cfg: Any,
+    device: torch.device,
+    checkpoint_path: Path,
+) -> None:
+    """Exercise checkpoint loading, gradients, and noisy evolutionary search."""
+    dataflow = _synthetic_dataflow(cfg, device)
+    architecture_probe = SuperQFCModel(copy.deepcopy(cfg.model.arch))
+    gene_choices = architecture_probe.arch_space
+    initial_gene = [choices[0] for choices in gene_choices]
+
+    clean_model = build_model_for_gene(cfg, initial_gene, device)
+    load_supercircuit_checkpoint(clean_model, checkpoint_path)
+    batch = dataflow["train"][0]
+    clean_outputs = clean_model(batch[cfg.dataset.input_name])
+    F.nll_loss(clean_outputs, batch[cfg.dataset.target_name]).backward()
+
+    noisy_model = build_model_for_gene(
+        cfg,
+        initial_gene,
+        device,
+        noisy_backend=FakeYorktownV2(),
+        n_shots=SMOKE_TEST_SHOTS,
+    )
+    noisy_model.load_state_dict(portable_state_dict(clean_model))
+    searcher = AccuracyEvolutionarySearcher(
+        gene_choices,
+        cfg,
+        dataflow,
+        device,
+        n_iterations=1,
+        parent_size=2,
+        mutation_size=1,
+        crossover_size=1,
+        mutation_probability=0.5,
+        max_validation_samples=2,
+    )
+    winners = searcher.search(noisy_model, n_experiments=1)
+    if len(winners) != 1 or len(winners[0]) != len(gene_choices):
+        raise RuntimeError("Smoke-test search returned an invalid gene")
+
+    logger.info(
+        f"QuantumNAS smoke test passed on {device} with gene {winners[0]}."
+    )
+
+
+def run_experiment(
+    cfg: Any,
+    device: torch.device,
+    checkpoint_path: Path,
+    n_experiments: int,
+) -> None:
+    """Run noisy architecture search, retraining, and final evaluation."""
+    run_name = f"quantumnas_style_search_{datetime.now():%Y%m%d_%H%M%S}"
+    run_dir = Path("runs") / run_name
+    set_run_dir(str(run_dir))
+
+    dataflow = build_dataflow(cfg, device)
+    noisy_backends = [FakeYorktownV2(), FakeTorino(), FakeManilaV2()]
+    logger.info(f"Run directory: {run_dir}")
+    logger.info(f"Device: {device}")
+    logger.info(f"Checkpoint: {checkpoint_path}")
+    logger.info(f"Seed: {cfg.debug.seed}")
+    logger.info(f"Search experiments per backend: {n_experiments}")
+    logger.info(f"Noisy backends: {[backend.name for backend in noisy_backends]}")
+
+    selected_genes = search_backends(
+        cfg,
+        dataflow,
+        device,
+        checkpoint_path,
+        noisy_backends,
+        n_experiments,
+    )
+    test_accuracies = train_and_evaluate_genes(
+        cfg,
+        dataflow,
+        device,
+        noisy_backends,
+        selected_genes,
+    )
+    logger.info(f"Selected genes by backend: {selected_genes}")
+    logger.info(f"Final noisy test accuracies: {test_accuracies}")
+
+
+def main() -> None:
+    """Load configuration and run the smoke test or full experiment."""
+    args = parse_args()
+    if args.experiments < 1:
+        raise ValueError("--experiments must be at least 1")
+
+    configs.load(args.config)
+    if isinstance(configs.optimizer.lr, str):
+        configs.optimizer.lr = float(configs.optimizer.lr)
+    device = configure_runtime(configs)
+    checkpoint_path = Path(args.checkpoint).resolve()
+
+    if args.smoke_test:
+        run_smoke_test(configs, device, checkpoint_path)
+    else:
+        run_experiment(
+            configs,
+            device,
+            checkpoint_path,
+            args.experiments,
+        )
 
 
 if __name__ == "__main__":
-    from datetime import datetime
-
-    run_name = f"quantumnas_style_search_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    run_dir = f"runs/{run_name}"
-    set_run_dir(run_dir)
-
-    logger.info(f"Run directory set to: {run_dir}")
-
-    from qiskit_ibm_runtime.fake_provider import FakeYorktownV2, FakeTorino, FakeManilaV2
-
-    noisy_backends = [FakeYorktownV2(), FakeTorino(), FakeManilaV2()]
-
-    gene_choises = [[1, 2, 3, 4], [1, 2, 3, 4], [1, 2, 3, 4], [1, 2, 3, 4], [1, 2, 3, 4], [1, 2, 3, 4], [1, 2, 3]]
-    # model = SuperQFCModel0(configs.model.arch)
-
-    logger.info("========== EXPERIMENT METADATA ==========")
-    logger.info(f"Seed: {configs.debug.seed}")
-    logger.info(f"Epochs: {configs.run.n_epochs}")
-    logger.info(f"Batch size: {configs.run.bsz}")
-    logger.info(f"Gene choices: {gene_choises}")
-    logger.info(f"Noisy backends: {[b.name for b in noisy_backends]}")
-    logger.info("========================================")
-
-
-    
-    agent = EvolutionarySearcher(gene_choice=gene_choises, accuracy_predictor=evaluate_gene, configs=configs)
-
-    # get the accuracy and gene of the best subcircuit
-    best_genes_all_backends = agent.run_search(noisy_backends=noisy_backends, n_experiments=5)
-
-
-    accs_all = []
-
-    ## Training all genes and finding the result
-
-    for genes, backend in zip(best_genes_all_backends, noisy_backends):
-        accs = []
-        for gene in genes:
-            best_acc = train_subcircuit_simple(gene=gene, noisy_backend=backend, n_epochs=configs.run.n_epochs, lr=configs.optimizer.lr, use_qiskit_eval=True, verbose=False)
-            accs.append(best_acc)
-        accs = np.array(accs)
-        logger.info(f"accs for backend {backend.name } with genes {genes} are {accs} with mean {accs.mean()} ")
-        accs_all.append(accs)
-
-    logger.info(f"all accs for all backens are {accs_all}")
+    main()
